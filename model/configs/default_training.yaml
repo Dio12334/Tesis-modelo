@@ -1,0 +1,18 @@
+training:
+  epochs: 100
+  batch_size: 16
+  learning_rate: 0.01
+  optimizer: SGD
+  weight_decay: 0.0005
+  momentum: 0.937
+  scheduler: cosine
+  warmup_epochs: 3
+  val_split: 0.2
+  checkpoint_dir: ./checkpoints
+  log_interval: 10
+  augmentation:
+    horizontal_flip: true
+    vertical_flip: false
+    rotation_range: 15
+    brightness_range: [0.8, 1.2]
+    mosaic: true

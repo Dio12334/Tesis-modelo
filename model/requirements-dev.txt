@@ -1,0 +1,16 @@
+# Road Damage Evaluation Framework - Development Dependencies
+# Install with: pip install -r model/requirements-dev.txt
+
+-r requirements.txt
+
+# Testing
+pytest>=7.0.0
+hypothesis>=6.70.0
+pytest-cov>=4.0.0
+
+# Linting / formatting
+ruff>=0.1.0
+black>=23.0.0
+
+# Type checking
+mypy>=1.0.0

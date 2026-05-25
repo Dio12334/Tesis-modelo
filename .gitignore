@@ -211,3 +211,5 @@ __marimo__/
 src/data/**
 mapyllary_extractor/src/data/**
 model/data/**
+.kiro/**
+checkpoints/**

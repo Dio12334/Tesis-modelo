@@ -1,0 +1,39 @@
+name: rdd2022_ssd_mobilenetv3
+
+model:
+  type: ssd_mobilenetv3
+  config:
+    input_size: 640
+    num_classes: 5
+
+dataset:
+  type: rdd2022
+  path: model/data/rdd2022/complete
+  # To use sample dataset:
+  # path: model/data/rdd2022/sample
+  # Uncomment to filter by country:
+  # country_filter: [Japan, India, Czech]
+  class_mapping: model/configs/rdd2022_classes.yaml
+
+training:
+  epochs: 50
+  early_stopping_patience: 10
+  batch_size: 24
+  learning_rate: 0.01
+  optimizer: SGD
+  weight_decay: 0.0005
+  momentum: 0.9
+  scheduler: cosine
+  warmup_epochs: 3
+  val_split: 0.2
+  checkpoint_dir: ./checkpoints/ssd_mobilenetv3
+  log_interval: 50
+
+evaluation:
+  iou_thresholds: [0.5]
+  confidence_threshold: 0.3
+
+output:
+  checkpoint_dir: ./checkpoints/ssd_mobilenetv3
+  results_dir: ./checkpoints/ssd_mobilenetv3
+  log_dir: ./logs/ssd_mobilenetv3
