@@ -9,8 +9,10 @@ model:
 dataset:
   type: rdd2022
   path: model/data/rdd2022/complete
+  data_yaml: model/data/rdd2022/complete_yolo/data.yaml
   # To use sample dataset:
   # path: model/data/rdd2022/sample
+  # data_yaml: model/data/rdd2022/sample_yolo/data.yaml
   # Uncomment to filter by country:
   # country_filter: [Japan, India, Czech]
   class_mapping: model/configs/rdd2022_classes.yaml
@@ -20,7 +22,7 @@ training:
   early_stopping_patience: 10
   batch_size: 64
   num_workers: 8
-  use_amp: true  # Mixed precision training (FP16) for faster training
+  use_amp: true
   learning_rate: 0.01
   optimizer: SGD
   weight_decay: 0.0005
