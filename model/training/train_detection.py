@@ -1,14 +1,16 @@
-"""Real PyTorch training loop for detection models.
+"""Unified training loop for detection models.
 
-This module provides a training function that performs actual gradient-based
-training using torchvision detection models. It works with the RDD2022Dataset
-and the SSDMobileNetV3 wrapper.
+This module provides a single, model-agnostic training function that operates
+exclusively through the BaseDetector interface. All registered model types are
+trained using the same epoch loop, optimizer construction, data loading, and
+loss computation path via `model.train_step()`.
 
 Usage:
     python -m model.training.train_detection --config model/configs/train_ssd_mobilenet.yaml
 """
 
 import argparse
+import inspect
 import logging
 import math
 import signal
@@ -26,7 +28,8 @@ import numpy as np
 from model.config.manager import ConfigManager
 from model.training.augmentation import build_augmentation_pipeline
 from model.datasets.rdd2022 import RDD2022Dataset
-from model.models.ssd_mobilenet import SSDMobileNetV3
+from model.models import ModelRegistry
+from model.exceptions import ModelNotFoundError, ConfigurationError
 from model.tracking.tracker import ExperimentTracker
 
 logger = logging.getLogger(__name__)
@@ -154,12 +157,16 @@ def collate_fn(batch):
 
 
 # -------------------------------------------------------------------------
-# Training function
+# Unified training function
 # -------------------------------------------------------------------------
 
 
 def train(config_path: str, verbose: bool = False) -> dict:
-    """Run the full training loop.
+    """Run the unified training loop for any registered detection model.
+
+    This function provides a single entry point that trains any model type
+    through the BaseDetector interface without model-type branching. All models
+    use the same data pipeline, optimizer construction, and epoch loop.
 
     Args:
         config_path: Path to the YAML training configuration.
@@ -183,6 +190,7 @@ def train(config_path: str, verbose: bool = False) -> dict:
 
     # Extract settings
     model_config = config.get("model", {}).get("config", {})
+    model_type = config.get("model", {}).get("type", "ssd_mobilenetv3")
     dataset_config = config.get("dataset", {})
     training_config = config.get("training", {})
 
@@ -199,9 +207,11 @@ def train(config_path: str, verbose: bool = False) -> dict:
     momentum = training_config.get("momentum", 0.937)
     warmup_epochs = training_config.get("warmup_epochs", 3)
     val_split = training_config.get("val_split", 0.2)
-    checkpoint_dir = Path(training_config.get("checkpoint_dir", "./checkpoints/ssd_mobilenetv3"))
+    checkpoint_dir = Path(training_config.get("checkpoint_dir", "./checkpoints"))
     log_interval = training_config.get("log_interval", 10)
-    use_amp = training_config.get("use_amp", True)  # Mixed precision training
+    use_amp = training_config.get("use_amp", True)
+    num_workers = training_config.get("num_workers", 4)
+    early_stopping_patience = training_config.get("early_stopping_patience", 15)
 
     # Reproducibility seed
     seed = training_config.get("seed", 42)
@@ -213,14 +223,40 @@ def train(config_path: str, verbose: bool = False) -> dict:
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(seed)
     torch.backends.cudnn.deterministic = False
-    torch.backends.cudnn.benchmark = True  # Faster training, slight non-determinism
+    torch.backends.cudnn.benchmark = True
     logger.info("Random seed set to %d", seed)
 
     # Device
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     logger.info("Using device: %s", device)
 
-    # Load dataset
+    # --- Instantiate model via ModelRegistry (no model-type branching) ---
+    model_cfg = dict(model_config)
+    model_cfg["num_classes"] = num_classes
+    logger.info("Building model '%s' (num_classes=%d)", model_type, num_classes)
+
+    try:
+        model = ModelRegistry.create(model_type, model_cfg)
+    except ModelNotFoundError as e:
+        logger.error("Failed to create model: %s", e)
+        return {}
+    except ConfigurationError as e:
+        logger.error("Model configuration error: %s", e)
+        return {}
+
+    # Move model to device — check for underlying nn.Module via common wrapper patterns
+    if hasattr(model, "_model") and hasattr(model._model, "model"):
+        # Ultralytics-style wrapper (e.g., YOLO26Detector)
+        model._model.model.to(device)
+    elif hasattr(model, "_model") and hasattr(model._model, "to"):
+        model._model.to(device)
+    elif hasattr(model, "model") and hasattr(model.model, "to"):
+        model.model.to(device)
+    elif hasattr(model, "to"):
+        model.to(device)
+    logger.info("Model moved to %s", device)
+
+    # --- Build data pipeline ---
     logger.info("Loading dataset from %s", dataset_path)
     rdd_dataset = RDD2022Dataset(country_filter=country_filter)
     rdd_dataset.load(Path(dataset_path))
@@ -228,36 +264,25 @@ def train(config_path: str, verbose: bool = False) -> dict:
 
     # Split into train/val
     train_ratio = 1.0 - val_split
-    train_ds, val_ds, _ = rdd_dataset.split(train_ratio, val_split, 0.0, seed=42)
+    train_ds, val_ds, _ = rdd_dataset.split(train_ratio, val_split, 0.0, seed=seed)
     logger.info("Train: %d, Val: %d", len(train_ds), len(val_ds))
 
-    # Create PyTorch datasets
     # Build augmentation pipeline from config (only applied to training set)
     aug_config = training_config.get("augmentation", {})
     augmentation_pipeline = build_augmentation_pipeline(aug_config) if aug_config else None
     logger.info("Augmentation pipeline: %s", augmentation_pipeline)
 
+    # Create PyTorch datasets
     train_torch = RDD2022TorchDataset(train_ds, input_size=input_size, augmentation=augmentation_pipeline)
     val_torch = RDD2022TorchDataset(val_ds, input_size=input_size)  # No augmentation for validation
 
-    # Update num_classes from actual dataset
-    actual_num_classes = train_torch.num_classes
-    if actual_num_classes != num_classes:
-        logger.warning(
-            "Config num_classes=%d but dataset has %d classes. Using %d.",
-            num_classes, actual_num_classes, actual_num_classes,
-        )
-        num_classes = actual_num_classes
-
     # Create data loaders
-    # Use multiple workers on Linux/WSL for parallel data loading
-    num_workers = training_config.get("num_workers", 4)
     train_loader = torch.utils.data.DataLoader(
         train_torch,
         batch_size=batch_size,
         shuffle=True,
         num_workers=num_workers,
-        pin_memory=True,  # Faster GPU transfer
+        pin_memory=True,
         persistent_workers=num_workers > 0,
         collate_fn=collate_fn,
     )
@@ -271,12 +296,7 @@ def train(config_path: str, verbose: bool = False) -> dict:
         collate_fn=collate_fn,
     )
 
-    # Build model
-    logger.info("Building SSD MobileNetV3 (input_size=%d, num_classes=%d)", input_size, num_classes)
-    model_cfg = {"input_size": input_size, "num_classes": num_classes}
-    model = SSDMobileNetV3(model_cfg)
-
-    # Create optimizer
+    # --- Construct optimizer from model.get_parameters() ---
     params = model.get_parameters()
     if optimizer_name.upper() == "SGD":
         optimizer = torch.optim.SGD(
@@ -286,63 +306,97 @@ def train(config_path: str, verbose: bool = False) -> dict:
         optimizer = torch.optim.Adam(params, lr=learning_rate, weight_decay=weight_decay)
     elif optimizer_name.upper() == "ADAMW":
         optimizer = torch.optim.AdamW(params, lr=learning_rate, weight_decay=weight_decay)
+    elif optimizer_name.upper() == "MUSGD":
+        try:
+            from ultralytics.optim.muon import MuSGD
+            optimizer = MuSGD(
+                params, lr=learning_rate, momentum=momentum,
+                weight_decay=weight_decay, nesterov=True,
+                use_muon=True, muon=0.2, sgd=1.0,
+            )
+            logger.info("Using MuSGD optimizer (Muon + SGD hybrid)")
+        except ImportError:
+            logger.warning(
+                "MuSGD requested but ultralytics is not installed. Falling back to SGD."
+            )
+            optimizer = torch.optim.SGD(
+                params, lr=learning_rate, momentum=momentum, weight_decay=weight_decay
+            )
     else:
+        # Fallback to SGD for unknown optimizer values
+        logger.warning("Unknown optimizer '%s', falling back to SGD", optimizer_name)
         optimizer = torch.optim.SGD(
             params, lr=learning_rate, momentum=momentum, weight_decay=weight_decay
         )
 
-    # Learning rate scheduler
-    lr_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+    # --- Learning rate scheduler: cosine annealing (stepped only after warmup) ---
+    cosine_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
         optimizer, T_max=epochs - warmup_epochs, eta_min=learning_rate * 0.01
     )
 
-    # Mixed precision training (AMP)
+    # --- Mixed precision training (AMP) ---
     scaler = torch.amp.GradScaler('cuda', enabled=use_amp)
     if use_amp:
         logger.info("Mixed precision training (AMP) enabled")
+    else:
+        logger.info("Mixed precision training (AMP) disabled, using full precision")
 
-    # Experiment tracking
-    output_config = config.get("output", {})
-    results_dir = Path(output_config.get("results_dir", "./results/ssd_mobilenetv3"))
-    tracker = ExperimentTracker(output_dir=results_dir)
-    run_id = tracker.start_run(
-        config=config,
-        model_name="ssd_mobilenetv3",
-        dataset_name=f"rdd2022_{len(rdd_dataset)}imgs",
-    )
-    logger.info("Experiment run ID: %s", run_id)
-
-    # Use run_id as the checkpoint subdirectory so each run is isolated
-    checkpoint_dir = checkpoint_dir / run_id
-    checkpoint_dir.mkdir(parents=True, exist_ok=True)
-
-    # Also save experiment results inside the run's checkpoint folder
-    import shutil as _shutil
-    run_results_path = checkpoint_dir / "experiment.json"
-
-    logger.info("Checkpoints and results will be saved to: %s", checkpoint_dir)
-    best_val_loss = float("inf")
-    best_epoch = -1
+    # --- SIGINT handling ---
     interrupted = False
-    patience = training_config.get("early_stopping_patience", 15)
-    epochs_without_improvement = 0
+    original_sigint_handler = signal.getsignal(signal.SIGINT)
 
-    def handle_sigint(signum, frame):
+    def _sigint_handler(signum, frame):
         nonlocal interrupted
-        logger.info("SIGINT received. Finishing current epoch...")
+        if interrupted:
+            # Second SIGINT: raise immediately
+            raise KeyboardInterrupt
         interrupted = True
+        logger.info("SIGINT received. Completing current epoch then stopping...")
 
-    original_handler = signal.getsignal(signal.SIGINT)
-    signal.signal(signal.SIGINT, handle_sigint)
+    signal.signal(signal.SIGINT, _sigint_handler)
+
+    # --- Experiment tracking ---
+    tracker = ExperimentTracker(output_dir=checkpoint_dir)
+    dataset_name = dataset_config.get("name", Path(dataset_path).name)
+
+    try:
+        run_id = tracker.start_run(config, model_type, dataset_name)
+    except Exception as e:
+        logger.error("Failed to start experiment run: %s", e)
+        signal.signal(signal.SIGINT, original_sigint_handler)
+        return {}
+
+    # Create checkpoint directory for this run
+    run_checkpoint_dir = checkpoint_dir / run_id
+    run_checkpoint_dir.mkdir(parents=True, exist_ok=True)
+
+    # --- Determine if save_checkpoint accepts extra params ---
+    save_sig = inspect.signature(model.save_checkpoint)
+    save_params = list(save_sig.parameters.keys())
+    supports_extra_checkpoint_params = "optimizer" in save_params
+
+    def _save_checkpoint(path: Path, optimizer_obj=None, epoch_num=None, metrics_dict=None):
+        """Save checkpoint, passing extra params if the model supports them."""
+        if supports_extra_checkpoint_params:
+            model.save_checkpoint(path, optimizer=optimizer_obj, epoch=epoch_num, metrics=metrics_dict)
+        else:
+            model.save_checkpoint(path)
+
+    # --- Epoch loop ---
+    logger.info("Starting training: %d epochs, batch_size=%d, lr=%.6f", epochs, batch_size, learning_rate)
+
+    avg_train_loss = 0.0
+    avg_val_loss = float("inf")
+    best_val_loss = float("inf")
+    best_epoch = 0
+    epochs_without_improvement = 0
+    completed_epochs = 0
 
     try:
         for epoch in range(epochs):
-            if interrupted:
-                break
-
             epoch_start = time.time()
 
-            # Warmup learning rate
+            # --- Linear warmup: LR = learning_rate * (epoch + 1) / warmup_epochs ---
             if epoch < warmup_epochs:
                 warmup_lr = learning_rate * (epoch + 1) / warmup_epochs
                 for param_group in optimizer.param_groups:
@@ -357,40 +411,63 @@ def train(config_path: str, verbose: bool = False) -> dict:
             train_batches = 0
 
             for batch_idx, (images, targets) in enumerate(train_loader):
-                if interrupted:
-                    break
+                # Move data to device
+                images = [img.to(device) for img in images]
+                targets = [{k: v.to(device) for k, v in t.items()} for t in targets]
 
-                # Skip batches with no valid targets
-                valid = [i for i, t in enumerate(targets) if t["boxes"].shape[0] > 0]
-                if len(valid) < 2:
+                optimizer.zero_grad()
+
+                try:
+                    # Forward pass with optional AMP autocast
+                    if use_amp:
+                        with torch.amp.autocast('cuda'):
+                            loss_dict = model.train_step(images, targets)
+                    else:
+                        loss_dict = model.train_step(images, targets)
+
+                    loss_tensor = loss_dict["loss_tensor"]
+
+                except Exception as e:
+                    # Handle exceptions in train_step: log warning, skip batch
+                    logger.warning(
+                        "Exception in train_step at epoch %d, batch %d: %s. Skipping batch.",
+                        epoch, batch_idx, e,
+                    )
                     continue
 
-                images = [images[i].to(device) for i in valid]
-                targets = [{k: v.to(device) for k, v in targets[i].items()} for i in valid]
+                # Handle zero-loss batches: skip backward/step
+                if loss_tensor.item() == 0.0:
+                    train_batches += 1
+                    continue
 
-                # Forward + backward with AMP
-                optimizer.zero_grad()
-                with torch.amp.autocast('cuda', enabled=use_amp):
-                    loss_dict = model._model(images, targets)
-                    total_loss = sum(loss for loss in loss_dict.values())
+                # Backward pass with gradient scaling
+                scaler.scale(loss_tensor).backward()
 
-                scaler.scale(total_loss).backward()
-                # Gradient clipping to prevent exploding gradients
+                # Unscale gradients before clipping
                 scaler.unscale_(optimizer)
                 torch.nn.utils.clip_grad_norm_(model.get_parameters(), max_norm=10.0)
+
+                # Optimizer step (scaler.step is a no-op if inf/NaN detected)
                 scaler.step(optimizer)
                 scaler.update()
 
-                train_loss_sum += total_loss.item()
+                train_loss_sum += loss_tensor.item()
                 train_batches += 1
 
                 if (batch_idx + 1) % log_interval == 0:
-                    avg_loss = train_loss_sum / train_batches
+                    avg_loss = train_loss_sum / max(train_batches, 1)
                     logger.info(
                         "Epoch %d/%d | Batch %d/%d | Loss: %.4f | LR: %.6f",
                         epoch + 1, epochs, batch_idx + 1, len(train_loader),
                         avg_loss, current_lr,
                     )
+
+            # Step cosine scheduler only at epochs >= warmup_epochs
+            if epoch >= warmup_epochs:
+                cosine_scheduler.step()
+
+            # Compute epoch training metrics
+            avg_train_loss = train_loss_sum / max(train_batches, 1)
 
             # --- Validation phase ---
             model.set_eval_mode()
@@ -399,153 +476,134 @@ def train(config_path: str, verbose: bool = False) -> dict:
 
             with torch.no_grad():
                 for images, targets in val_loader:
-                    valid = [i for i, t in enumerate(targets) if t["boxes"].shape[0] > 0]
-                    # Need at least 2 samples for BatchNorm in train mode
-                    if len(valid) < 2:
+                    images = [img.to(device) for img in images]
+                    targets = [{k: v.to(device) for k, v in t.items()} for t in targets]
+
+                    try:
+                        loss_dict = model.train_step(images, targets)
+                        loss_tensor = loss_dict["loss_tensor"]
+                        val_loss_sum += loss_tensor.item()
+                        val_batches += 1
+                    except Exception as e:
+                        logger.warning(
+                            "Exception in validation train_step at epoch %d: %s. Skipping batch.",
+                            epoch, e,
+                        )
                         continue
 
-                    images = [images[i].to(device) for i in valid]
-                    targets = [{k: v.to(device) for k, v in targets[i].items()} for i in valid]
-
-                    # Set to train mode for loss computation, but freeze BN stats
-                    model._model.train()
-                    for module in model._model.modules():
-                        if isinstance(module, (torch.nn.BatchNorm2d, torch.nn.SyncBatchNorm)):
-                            module.eval()
-                    with torch.amp.autocast('cuda', enabled=use_amp):
-                        loss_dict = model._model(images, targets)
-                    model._model.eval()
-
-                    val_loss = sum(loss for loss in loss_dict.values())
-                    val_loss_sum += val_loss.item()
-                    val_batches += 1
-
-            # Compute epoch metrics
-            avg_train_loss = train_loss_sum / max(train_batches, 1)
             avg_val_loss = val_loss_sum / max(val_batches, 1)
-            epoch_time = time.time() - epoch_start
 
-            # Step scheduler (after warmup)
-            if epoch >= warmup_epochs:
-                lr_scheduler.step()
+            epoch_time = time.time() - epoch_start
+            completed_epochs = epoch + 1
 
             logger.info(
                 "Epoch %d/%d complete | Train Loss: %.4f | Val Loss: %.4f | Time: %.1fs | LR: %.6f",
                 epoch + 1, epochs, avg_train_loss, avg_val_loss, epoch_time, current_lr,
             )
 
-            # Log metrics
-            tracker.log_metrics(run_id, step=epoch, metrics={
+            # --- Experiment tracking: log metrics per epoch ---
+            epoch_metrics = {
                 "train_loss": avg_train_loss,
                 "val_loss": avg_val_loss,
                 "learning_rate": current_lr,
                 "epoch_time_s": epoch_time,
-            })
+            }
+            try:
+                tracker.log_metrics(run_id, step=epoch, metrics=epoch_metrics)
+            except Exception as e:
+                logger.warning("Failed to log metrics for epoch %d: %s", epoch, e)
 
-            # Save best checkpoint
+            # --- Checkpointing ---
+            current_metrics = {
+                "train_loss": avg_train_loss,
+                "val_loss": avg_val_loss,
+            }
+
+            # Best checkpoint: save when val_loss improves
             if avg_val_loss < best_val_loss:
                 best_val_loss = avg_val_loss
-                best_epoch = epoch
+                best_epoch = epoch + 1  # 1-indexed
                 epochs_without_improvement = 0
-                model.save_checkpoint(
-                    checkpoint_dir / "best_model.pt",
-                    optimizer=optimizer,
-                    epoch=epoch,
-                    metrics={"val_loss": avg_val_loss, "train_loss": avg_train_loss},
-                )
-                logger.info("New best model saved (val_loss=%.4f)", avg_val_loss)
+                try:
+                    _save_checkpoint(
+                        run_checkpoint_dir / "best_model.pt",
+                        optimizer_obj=optimizer,
+                        epoch_num=epoch,
+                        metrics_dict=current_metrics,
+                    )
+                    logger.info("Saved best model checkpoint (val_loss=%.4f)", avg_val_loss)
+                except (IOError, OSError) as e:
+                    logger.warning("Failed to save best checkpoint: %s", e)
             else:
                 epochs_without_improvement += 1
-                if epochs_without_improvement >= patience:
-                    logger.info(
-                        "Early stopping triggered: no improvement for %d epochs. "
-                        "Best val_loss=%.4f at epoch %d.",
-                        patience, best_val_loss, best_epoch + 1,
-                    )
-                    break
 
-            # Save recovery checkpoint every 5 epochs
+            # Recovery checkpoint: every 5 epochs (1-indexed, so epoch+1 % 5 == 0)
             if (epoch + 1) % 5 == 0:
-                model.save_checkpoint(
-                    checkpoint_dir / "recovery.pt",
-                    optimizer=optimizer,
-                    epoch=epoch,
-                    metrics={"val_loss": avg_val_loss, "train_loss": avg_train_loss},
+                try:
+                    _save_checkpoint(
+                        run_checkpoint_dir / "recovery.pt",
+                        optimizer_obj=optimizer,
+                        epoch_num=epoch,
+                        metrics_dict=current_metrics,
+                    )
+                    logger.info("Saved recovery checkpoint at epoch %d", epoch + 1)
+                except (IOError, OSError) as e:
+                    logger.warning("Failed to save recovery checkpoint: %s", e)
+
+            # --- Early stopping check ---
+            if epochs_without_improvement >= early_stopping_patience:
+                logger.info(
+                    "Early stopping triggered: no improvement for %d epochs. "
+                    "Best val_loss=%.4f at epoch %d (patience=%d)",
+                    epochs_without_improvement, best_val_loss, best_epoch, early_stopping_patience,
                 )
+                break
 
-    finally:
-        signal.signal(signal.SIGINT, original_handler)
+            # --- Check for interruption ---
+            if interrupted:
+                logger.info("Training interrupted after epoch %d", epoch + 1)
+                break
 
-    # Save final checkpoint
-    model.save_checkpoint(
-        checkpoint_dir / "final_model.pt",
-        optimizer=optimizer,
-        epoch=epoch if 'epoch' in dir() else 0,
-        metrics={"val_loss": avg_val_loss if 'avg_val_loss' in dir() else 0,
-                 "train_loss": avg_train_loss if 'avg_train_loss' in dir() else 0},
-    )
+    except KeyboardInterrupt:
+        # Second SIGINT caused immediate termination
+        logger.warning("Training forcefully interrupted (double SIGINT)")
 
-    # End experiment
+    # --- Final checkpoint ---
+    final_metrics_dict = {
+        "train_loss": avg_train_loss,
+        "val_loss": avg_val_loss,
+    }
+    try:
+        _save_checkpoint(
+            run_checkpoint_dir / "final_model.pt",
+            optimizer_obj=optimizer,
+            epoch_num=completed_epochs - 1 if completed_epochs > 0 else 0,
+            metrics_dict=final_metrics_dict,
+        )
+        logger.info("Saved final model checkpoint")
+    except (IOError, OSError) as e:
+        logger.error("Failed to save final checkpoint: %s", e)
+        signal.signal(signal.SIGINT, original_sigint_handler)
+        sys.exit(1)
+
+    # --- End experiment tracking ---
     final_metrics = {
-        "final_train_loss": avg_train_loss if 'avg_train_loss' in dir() else 0,
-        "final_val_loss": avg_val_loss if 'avg_val_loss' in dir() else 0,
-        "best_val_loss": best_val_loss if best_val_loss != float("inf") else 0,
+        "final_train_loss": avg_train_loss,
+        "final_val_loss": avg_val_loss,
+        "best_val_loss": best_val_loss,
         "best_epoch": best_epoch,
-        "total_epochs": epoch + 1 if 'epoch' in dir() else 0,
+        "total_epochs": completed_epochs,
         "run_id": run_id,
     }
-    tracker.end_run(run_id, final_metrics)
+    try:
+        tracker.end_run(run_id, final_metrics)
+    except Exception as e:
+        logger.warning("Failed to end experiment run: %s", e)
 
-    # Copy experiment results into the run's checkpoint folder
-    tracker_json = results_dir / f"{run_id}.json"
-    if tracker_json.exists():
-        import shutil
-        shutil.copy2(tracker_json, run_results_path)
-        logger.info("Experiment results saved to: %s", run_results_path)
-
-    # Update global best model if this run is better than previous runs
-    global_dir = checkpoint_dir.parent / "global"
-    global_dir.mkdir(parents=True, exist_ok=True)
-    global_best_path = global_dir / "best_model.pt"
-    global_best_meta_path = global_dir / "best.json"
-    current_best = best_val_loss if best_val_loss != float("inf") else float("inf")
-
-    should_update_global = True
-    if global_best_meta_path.exists():
-        import json as _json
-        with open(global_best_meta_path, "r") as f:
-            prev_best = _json.load(f)
-        if prev_best.get("best_val_loss", float("inf")) <= current_best:
-            should_update_global = False
-            logger.info(
-                "Global best unchanged (previous: %.4f from run %s, current: %.4f)",
-                prev_best["best_val_loss"], prev_best["run_id"], current_best,
-            )
-
-    if should_update_global and current_best < float("inf"):
-        import shutil
-        run_best_path = checkpoint_dir / "best_model.pt"
-        if run_best_path.exists():
-            shutil.copy2(run_best_path, global_best_path)
-            import json as _json
-            with open(global_best_meta_path, "w") as f:
-                _json.dump({
-                    "run_id": run_id,
-                    "best_val_loss": current_best,
-                    "best_epoch": best_epoch,
-                    "config": config,
-                }, f, indent=2, default=str)
-            logger.info(
-                "Global best model updated (val_loss=%.4f, run=%s)",
-                current_best, run_id,
-            )
+    # --- Restore original SIGINT handler ---
+    signal.signal(signal.SIGINT, original_sigint_handler)
 
     logger.info("Training complete!")
-    logger.info("  Best val loss: %.4f (epoch %d)", best_val_loss, best_epoch + 1)
-    logger.info("  Checkpoints: %s", checkpoint_dir)
-    logger.info("  Global best: %s", global_best_path)
-    logger.info("  Experiment: %s", run_id)
-
     return final_metrics
 
 
@@ -555,7 +613,7 @@ def train(config_path: str, verbose: bool = False) -> dict:
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Train SSD MobileNetV3 on RDD2022")
+    parser = argparse.ArgumentParser(description="Train detection models on RDD2022")
     parser.add_argument("--config", type=str, required=True, help="Path to training config YAML")
     parser.add_argument("--verbose", "-v", action="store_true", help="Enable debug logging")
     args = parser.parse_args()
