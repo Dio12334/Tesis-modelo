@@ -287,6 +287,7 @@ def train(config_path: str, verbose: bool = False) -> dict:
     val_split = training_config.get("val_split", 0.2)
     checkpoint_dir = Path(training_config.get("checkpoint_dir", "./checkpoints/ssd_mobilenetv3"))
     log_interval = training_config.get("log_interval", 10)
+    use_amp = training_config.get("use_amp", True)  # Mixed precision training
 
     # Reproducibility seed
     seed = training_config.get("seed", 42)
@@ -297,8 +298,8 @@ def train(config_path: str, verbose: bool = False) -> dict:
     torch.manual_seed(seed)
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(seed)
-    torch.backends.cudnn.deterministic = True
-    torch.backends.cudnn.benchmark = False
+    torch.backends.cudnn.deterministic = False
+    torch.backends.cudnn.benchmark = True  # Faster training, slight non-determinism
     logger.info("Random seed set to %d", seed)
 
     # Device
@@ -335,18 +336,24 @@ def train(config_path: str, verbose: bool = False) -> dict:
         num_classes = actual_num_classes
 
     # Create data loaders
+    # Use multiple workers on Linux/WSL for parallel data loading
+    num_workers = training_config.get("num_workers", 4)
     train_loader = torch.utils.data.DataLoader(
         train_torch,
         batch_size=batch_size,
         shuffle=True,
-        num_workers=0,  # Use 0 for Windows compatibility
+        num_workers=num_workers,
+        pin_memory=True,  # Faster GPU transfer
+        persistent_workers=num_workers > 0,
         collate_fn=collate_fn,
     )
     val_loader = torch.utils.data.DataLoader(
         val_torch,
         batch_size=batch_size,
         shuffle=False,
-        num_workers=0,
+        num_workers=num_workers,
+        pin_memory=True,
+        persistent_workers=num_workers > 0,
         collate_fn=collate_fn,
     )
 
@@ -376,6 +383,11 @@ def train(config_path: str, verbose: bool = False) -> dict:
     lr_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
         optimizer, T_max=epochs - warmup_epochs, eta_min=learning_rate * 0.01
     )
+
+    # Mixed precision training (AMP)
+    scaler = torch.amp.GradScaler('cuda', enabled=use_amp)
+    if use_amp:
+        logger.info("Mixed precision training (AMP) enabled")
 
     # Experiment tracking
     output_config = config.get("output", {})
@@ -444,15 +456,18 @@ def train(config_path: str, verbose: bool = False) -> dict:
                 images = [images[i].to(device) for i in valid]
                 targets = [{k: v.to(device) for k, v in targets[i].items()} for i in valid]
 
-                # Forward + backward
+                # Forward + backward with AMP
                 optimizer.zero_grad()
-                loss_dict = model._model(images, targets)
-                total_loss = sum(loss for loss in loss_dict.values())
+                with torch.amp.autocast('cuda', enabled=use_amp):
+                    loss_dict = model._model(images, targets)
+                    total_loss = sum(loss for loss in loss_dict.values())
 
-                total_loss.backward()
+                scaler.scale(total_loss).backward()
                 # Gradient clipping to prevent exploding gradients
+                scaler.unscale_(optimizer)
                 torch.nn.utils.clip_grad_norm_(model.get_parameters(), max_norm=10.0)
-                optimizer.step()
+                scaler.step(optimizer)
+                scaler.update()
 
                 train_loss_sum += total_loss.item()
                 train_batches += 1
@@ -485,7 +500,8 @@ def train(config_path: str, verbose: bool = False) -> dict:
                     for module in model._model.modules():
                         if isinstance(module, (torch.nn.BatchNorm2d, torch.nn.SyncBatchNorm)):
                             module.eval()
-                    loss_dict = model._model(images, targets)
+                    with torch.amp.autocast('cuda', enabled=use_amp):
+                        loss_dict = model._model(images, targets)
                     model._model.eval()
 
                     val_loss = sum(loss for loss in loss_dict.values())
