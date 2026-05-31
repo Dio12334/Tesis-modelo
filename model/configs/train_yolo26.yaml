@@ -1,0 +1,39 @@
+name: rdd2022_yolo26m
+
+model:
+  type: yolo26
+  config:
+    model_size: "m"
+    num_classes: 5
+    end2end: true
+    confidence_threshold: 0.25
+    iou_threshold: 0.7
+    pretrained_weights: "yolo26m.pt"
+
+dataset:
+  type: rdd2022
+  path: model/data/rdd2022/sample_yolo
+  data_yaml: model/data/rdd2022/sample_yolo/data.yaml
+  class_mapping: model/configs/rdd2022_classes.yaml
+
+training:
+  epochs: 100
+  batch_size: 16
+  learning_rate: 0.01
+  optimizer: SGD
+  weight_decay: 0.0005
+  momentum: 0.937
+  scheduler: cosine
+  warmup_epochs: 3
+  val_split: 0.2
+  checkpoint_dir: ./checkpoints/yolo26
+  log_interval: 50
+
+evaluation:
+  iou_thresholds: [0.5]
+  confidence_threshold: 0.25
+
+output:
+  checkpoint_dir: ./checkpoints/yolo26
+  results_dir: ./checkpoints/yolo26
+  log_dir: ./logs/yolo26

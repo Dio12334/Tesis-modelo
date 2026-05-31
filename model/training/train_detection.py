@@ -26,6 +26,7 @@ import numpy as np
 from model.config.manager import ConfigManager
 from model.training.augmentation import build_augmentation_pipeline
 from model.datasets.rdd2022 import RDD2022Dataset
+from model.models import ModelRegistry
 from model.models.ssd_mobilenet import SSDMobileNetV3
 from model.tracking.tracker import ExperimentTracker
 
@@ -158,6 +159,84 @@ def collate_fn(batch):
 # -------------------------------------------------------------------------
 
 
+def _train_ultralytics(config: dict, model_config: dict, dataset_config: dict,
+                       training_config: dict, verbose: bool) -> dict:
+    """Run training using Ultralytics native API (YOLO26 with ProgLoss + MuSGD).
+
+    Translates the framework's YAML config into Ultralytics model.train() arguments.
+
+    Args:
+        config: Full experiment config dict.
+        model_config: model.config section.
+        dataset_config: dataset section.
+        training_config: training section.
+        verbose: Enable verbose output.
+
+    Returns:
+        Dict with final training metrics.
+    """
+    from ultralytics import YOLO
+
+    # Model weights
+    model_size = model_config.get("model_size", "m")
+    pretrained_weights = model_config.get("pretrained_weights", f"yolo26{model_size}.pt")
+
+    # Dataset - expects a data.yaml path for Ultralytics
+    data_path = dataset_config.get("data_yaml", dataset_config.get("path", "") + "/data.yaml")
+
+    # Training hyperparameters → Ultralytics arguments
+    epochs = training_config.get("epochs", 100)
+    batch_size = training_config.get("batch_size", 16)
+    imgsz = model_config.get("input_size", 640)
+    lr0 = training_config.get("learning_rate", 0.01)
+    weight_decay = training_config.get("weight_decay", 0.0005)
+    momentum = training_config.get("momentum", 0.937)
+    warmup_epochs = training_config.get("warmup_epochs", 3)
+    patience = training_config.get("early_stopping_patience", 50)
+
+    # Output
+    output_config = config.get("output", {})
+    project = output_config.get("checkpoint_dir", "./checkpoints/yolo26")
+    name = config.get("name", "run")
+
+    logger.info("Using Ultralytics native training for YOLO26")
+    logger.info("  Model: %s", pretrained_weights)
+    logger.info("  Data: %s", data_path)
+    logger.info("  Epochs: %d, Batch: %d, ImgSz: %d", epochs, batch_size, imgsz)
+
+    # Load model
+    model = YOLO(pretrained_weights)
+
+    # Train using Ultralytics API (includes ProgLoss, MuSGD, STAL)
+    results = model.train(
+        data=data_path,
+        epochs=epochs,
+        batch=batch_size,
+        imgsz=imgsz,
+        lr0=lr0,
+        weight_decay=weight_decay,
+        momentum=momentum,
+        warmup_epochs=warmup_epochs,
+        patience=patience,
+        project=project,
+        name=name,
+        exist_ok=True,
+        verbose=verbose,
+    )
+
+    # Extract metrics from results
+    final_metrics = {
+        "model_type": "yolo26",
+        "training_mode": "ultralytics_native",
+        "epochs": epochs,
+        "project": project,
+        "name": name,
+    }
+
+    logger.info("Training complete! Results saved to: %s/%s", project, name)
+    return final_metrics
+
+
 def train(config_path: str, verbose: bool = False) -> dict:
     """Run the full training loop.
 
@@ -183,8 +262,15 @@ def train(config_path: str, verbose: bool = False) -> dict:
 
     # Extract settings
     model_config = config.get("model", {}).get("config", {})
+    model_type = config.get("model", {}).get("type", "ssd_mobilenetv3")
     dataset_config = config.get("dataset", {})
     training_config = config.get("training", {})
+
+    # --- Ultralytics native training for YOLO26 ---
+    if model_type == "yolo26":
+        return _train_ultralytics(config, model_config, dataset_config, training_config, verbose)
+
+    # --- Framework training loop (SSD, YOLOv6, etc.) ---
 
     input_size = model_config.get("input_size", 320)
     num_classes = model_config.get("num_classes", 5)
@@ -265,9 +351,11 @@ def train(config_path: str, verbose: bool = False) -> dict:
     )
 
     # Build model
-    logger.info("Building SSD MobileNetV3 (input_size=%d, num_classes=%d)", input_size, num_classes)
-    model_cfg = {"input_size": input_size, "num_classes": num_classes}
-    model = SSDMobileNetV3(model_cfg)
+    model_type = config.get("model", {}).get("type", "ssd_mobilenetv3")
+    model_cfg = dict(model_config)
+    model_cfg["num_classes"] = num_classes
+    logger.info("Building model '%s' (num_classes=%d)", model_type, num_classes)
+    model = ModelRegistry.create(model_type, model_cfg)
 
     # Create optimizer
     params = model.get_parameters()
@@ -295,7 +383,7 @@ def train(config_path: str, verbose: bool = False) -> dict:
     tracker = ExperimentTracker(output_dir=results_dir)
     run_id = tracker.start_run(
         config=config,
-        model_name="ssd_mobilenetv3",
+        model_name=model_type,
         dataset_name=f"rdd2022_{len(rdd_dataset)}imgs",
     )
     logger.info("Experiment run ID: %s", run_id)
@@ -539,7 +627,7 @@ def train(config_path: str, verbose: bool = False) -> dict:
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Train SSD MobileNetV3 on RDD2022")
+    parser = argparse.ArgumentParser(description="Train detection models on RDD2022")
     parser.add_argument("--config", type=str, required=True, help="Path to training config YAML")
     parser.add_argument("--verbose", "-v", action="store_true", help="Enable debug logging")
     args = parser.parse_args()

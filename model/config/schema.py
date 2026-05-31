@@ -2,6 +2,8 @@
 
 Defines the EXPERIMENT_SCHEMA used by ConfigManager.validate() to check
 experiment configuration files against expected structure, types, and constraints.
+
+Also defines model-specific schemas for validating model.config sections.
 """
 
 EXPERIMENT_SCHEMA: dict = {
@@ -91,4 +93,47 @@ EXPERIMENT_SCHEMA: dict = {
             },
         },
     },
+}
+
+
+# Model-specific config schemas keyed by model type
+YOLO26_MODEL_CONFIG_SCHEMA: dict = {
+    "required": [
+        "model_size",
+        "num_classes",
+        "end2end",
+        "confidence_threshold",
+        "iou_threshold",
+    ],
+    "properties": {
+        "model_size": {
+            "type": "str",
+            "enum": ["n", "s", "m", "l", "x"],
+        },
+        "num_classes": {
+            "type": "int",
+            "min": 1,
+            "max": 1000,
+        },
+        "end2end": {
+            "type": "bool",
+        },
+        "confidence_threshold": {
+            "type": "float",
+            "min": 0.0,
+            "max": 1.0,
+        },
+        "iou_threshold": {
+            "type": "float",
+            "min": 0.0,
+            "max": 1.0,
+        },
+        "pretrained_weights": {
+            "type": "str",
+        },
+    },
+}
+
+MODEL_CONFIG_SCHEMAS: dict = {
+    "yolo26": YOLO26_MODEL_CONFIG_SCHEMA,
 }
