@@ -17,14 +17,14 @@ dataset:
   class_mapping: model/configs/rdd2022_classes.yaml
 
 training:
-  epochs: 100
-  early_stopping_patience: 25
+  epochs: 200
+  early_stopping_patience: 50
   batch_size: 16
   num_workers: 4
   use_amp: true
-  learning_rate: 0.0005
+  learning_rate: 0.01
   optimizer: MuSGD
-  weight_decay: 0.005
+  weight_decay: 0.0005
   momentum: 0.937
   scheduler: cosine
   warmup_epochs: 5
@@ -35,11 +35,15 @@ training:
   num_workers: 12
   augmentation:
     horizontal_flip: true
-    brightness_range: [0.8, 1.2]
+    brightness_range: [0.7, 1.3]
+    hsv_h: 0.015
+    hsv_s: 0.7
+    hsv_v: 0.4
+    scale: [0.5, 1.5]
 
   
 evaluation:
-  iou_thresholds: [0.25]
+  iou_thresholds: [0.5]
   confidence_threshold: 0.25
 
 output:
