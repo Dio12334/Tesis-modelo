@@ -248,6 +248,11 @@ def train(config_path: str, verbose: bool = False) -> dict:
     if hasattr(model, "_model") and hasattr(model._model, "model"):
         # Ultralytics-style wrapper (e.g., YOLO26Detector)
         model._model.model.to(device)
+        # Re-initialize criterion on the correct device (must happen after .to(device))
+        if hasattr(model._model.model, "init_criterion"):
+            model._model.model.criterion = model._model.model.init_criterion()
+            if hasattr(model, "_loss_fn"):
+                model._loss_fn = model._model.model.criterion
     elif hasattr(model, "_model") and hasattr(model._model, "to"):
         model._model.to(device)
     elif hasattr(model, "model") and hasattr(model.model, "to"):
@@ -309,10 +314,22 @@ def train(config_path: str, verbose: bool = False) -> dict:
     elif optimizer_name.upper() == "MUSGD":
         try:
             from ultralytics.optim.muon import MuSGD
+            # MuSGD needs parameter groups: use_muon=True only for ndim >= 2
+            muon_params = []
+            sgd_params = []
+            for p in params:
+                if p.ndim >= 2:
+                    muon_params.append(p)
+                else:
+                    sgd_params.append(p)
+            param_groups = [
+                {"params": muon_params, "use_muon": True},
+                {"params": sgd_params, "use_muon": False},
+            ]
             optimizer = MuSGD(
-                params, lr=learning_rate, momentum=momentum,
+                param_groups, lr=learning_rate, momentum=momentum,
                 weight_decay=weight_decay, nesterov=True,
-                use_muon=True, muon=0.2, sgd=1.0,
+                muon=0.2, sgd=1.0,
             )
             logger.info("Using MuSGD optimizer (Muon + SGD hybrid)")
         except ImportError:
