@@ -1,7 +1,7 @@
 """Custom exception hierarchy for the Road Damage Evaluation Framework."""
 
 from pathlib import Path
-from typing import List
+from typing import List, Optional
 
 
 class FrameworkError(Exception):
@@ -42,14 +42,34 @@ class UnmappedClassError(FrameworkError):
 
 
 class ModelNotFoundError(FrameworkError):
-    """Raised when requesting an unregistered model."""
+    """Raised when requesting an unregistered model.
 
-    def __init__(self, model_name: str, available_models: List[str]):
+    The message lists the available models in alphabetical order and, when
+    provided, appends a "Did you mean" suggestion and the underlying cause of
+    a failed instantiation. The original two-argument constructor remains
+    supported for backward compatibility.
+    """
+
+    def __init__(
+        self,
+        model_name: str,
+        available_models: List[str],
+        suggestion: Optional[str] = None,
+        cause: Optional[str] = None,
+    ):
         self.model_name = model_name
-        self.available_models = available_models
-        super().__init__(
-            f"Model '{model_name}' not found. Available: {available_models}"
-        )
+        self.available_models = sorted(available_models)
+        self.suggestion = suggestion
+        self.cause = cause
+        lines = [
+            f"Model '{model_name}' not found.",
+            f"Available models: {self.available_models}",
+        ]
+        if suggestion:
+            lines.append(f"Did you mean: {suggestion}?")
+        if cause:
+            lines.append(f"Underlying error: {cause}")
+        super().__init__(" ".join(lines))
 
 
 class ConfigurationError(FrameworkError):

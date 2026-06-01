@@ -34,8 +34,8 @@ training:
   seed: 42
   
 evaluation:
-  iou_thresholds: [0.5]
-  confidence_threshold: 0.25
+  iou_thresholds: [0.25]
+  confidence_threshold: 0.05
 
 output:
   checkpoint_dir: ./checkpoints/yolo26

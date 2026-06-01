@@ -61,6 +61,58 @@ class BaseDetector(ABC):
         """
         ...
 
+    def _underlying_model(self):
+        """Return the wrapped model object, preferring ``_model`` then ``model``.
+
+        Returns:
+            The wrapped ``nn.Module``-like object held in the ``_model``
+            attribute when present and non-None, otherwise the object held in
+            the ``model`` attribute, or ``None`` when neither is present.
+        """
+        if getattr(self, "_model", None) is not None:
+            return self._model
+        return getattr(self, "model", None)
+
+    def set_train_mode(self) -> None:
+        """Set the underlying model to training mode.
+
+        Default implementation that operates on whichever of ``_model`` or
+        ``model`` is present. A no-op when neither attribute is set or the
+        wrapped object does not expose a ``train`` method.
+        """
+        m = self._underlying_model()
+        if m is not None and hasattr(m, "train"):
+            m.train()
+
+    def set_eval_mode(self) -> None:
+        """Set the underlying model to evaluation mode.
+
+        Default implementation that operates on whichever of ``_model`` or
+        ``model`` is present. A no-op when neither attribute is set or the
+        wrapped object does not expose an ``eval`` method.
+        """
+        m = self._underlying_model()
+        if m is not None and hasattr(m, "eval"):
+            m.eval()
+
+    def to_device(self, device) -> None:
+        """Move the wrapped model to ``device``.
+
+        Default implementation that operates on whichever of ``_model`` or
+        ``model`` is present. A no-op when neither attribute is set or the
+        wrapped object does not expose a ``to`` method. Subclasses that manage
+        their own device placement (Requirement 2.6) override this method and
+        the override leaves the model on the requested device.
+
+        Args:
+            device: The target device to move the wrapped model to.
+        """
+        m = self._underlying_model()
+        if m is not None and hasattr(m, "to"):
+            m.to(device)
+        if hasattr(self, "_device"):
+            self._device = device
+
 
 class ModelRegistry:
     """Singleton registry for detection model classes.
