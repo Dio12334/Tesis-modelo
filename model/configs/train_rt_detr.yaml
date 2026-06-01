@@ -1,0 +1,44 @@
+name: rdd2022_rt_detr_l
+
+model:
+  type: rt_detr
+  config:
+    model_size: "l"
+    input_size: 640
+    num_classes: 5
+    confidence_threshold: 0.25
+    iou_threshold: 0.7
+
+dataset:
+  type: rdd2022
+  path: model/data/rdd2022/sample
+  class_mapping: model/configs/rdd2022_classes.yaml
+
+training:
+  epochs: 100
+  early_stopping_patience: 25
+  batch_size: 4
+  num_workers: 4
+  use_amp: true
+  learning_rate: 0.0001
+  optimizer: AdamW
+  weight_decay: 0.0001
+  momentum: 0.937
+  scheduler: cosine
+  warmup_epochs: 5
+  val_split: 0.2
+  checkpoint_dir: ./checkpoints/rt_detr
+  log_interval: 10
+  seed: 42
+  augmentation:
+    horizontal_flip: true
+    brightness_range: [0.8, 1.2]
+
+evaluation:
+  iou_thresholds: [0.25, 0.5, 0.75]
+  confidence_threshold: 0.25
+
+output:
+  checkpoint_dir: ./checkpoints/rt_detr
+  results_dir: ./results/rt_detr
+  log_dir: ./logs/rt_detr

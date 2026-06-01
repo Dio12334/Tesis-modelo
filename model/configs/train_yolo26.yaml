@@ -3,13 +3,13 @@ name: rdd2022_yolo26n
 model:
   type: yolo26
   config:
-    model_size: "n"
+    model_size: "m"
     input_size: 640
     num_classes: 5
     end2end: false
     confidence_threshold: 0.25
     iou_threshold: 0.5
-    pretrained_weights: "yolo26n.pt"
+    pretrained_weights: "yolo26m.pt"
 
 dataset:
   type: rdd2022
@@ -17,14 +17,14 @@ dataset:
   class_mapping: model/configs/rdd2022_classes.yaml
 
 training:
-  epochs: 100
-  early_stopping_patience: 25
+  epochs: 200
+  early_stopping_patience: 50
   batch_size: 16
   num_workers: 4
-  use_amp: false
-  learning_rate: 0.0005
+  use_amp: true
+  learning_rate: 0.01
   optimizer: MuSGD
-  weight_decay: 0.005
+  weight_decay: 0.0005
   momentum: 0.937
   scheduler: cosine
   warmup_epochs: 5
@@ -32,14 +32,18 @@ training:
   checkpoint_dir: ./checkpoints/yolo26
   log_interval: 10
   seed: 42
+  num_workers: 12
   augmentation:
     horizontal_flip: true
-    rotation_range: 10
-    brightness_range: [0.8, 1.2]
+    brightness_range: [0.7, 1.3]
+    hsv_h: 0.015
+    hsv_s: 0.7
+    hsv_v: 0.4
+    scale: [0.5, 1.5]
 
   
 evaluation:
-  iou_thresholds: [0.25]
+  iou_thresholds: [0.5]
   confidence_threshold: 0.25
 
 output:

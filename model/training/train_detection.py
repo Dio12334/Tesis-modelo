@@ -246,13 +246,22 @@ def train(config_path: str, verbose: bool = False) -> dict:
 
     # Move model to device — check for underlying nn.Module via common wrapper patterns
     if hasattr(model, "_model") and hasattr(model._model, "model"):
-        # Ultralytics-style wrapper (e.g., YOLO26Detector)
+        # Ultralytics-style wrapper (e.g., YOLO26Detector, RT_DETR_Detector)
         model._model.model.to(device)
         # Re-initialize criterion on the correct device (must happen after .to(device))
+        # Note: RT-DETR's init_criterion() may fail because RTDETRDecoder lacks
+        # the 'stride' attribute expected by v8DetectionLoss. In that case, fall
+        # back to the existing criterion or use model.loss() directly.
         if hasattr(model._model.model, "init_criterion"):
-            model._model.model.criterion = model._model.model.init_criterion()
-            if hasattr(model, "_loss_fn"):
-                model._loss_fn = model._model.model.criterion
+            try:
+                model._model.model.criterion = model._model.model.init_criterion()
+                if hasattr(model, "_loss_fn"):
+                    model._loss_fn = model._model.model.criterion
+            except (AttributeError, TypeError) as e:
+                logger.debug(
+                    "init_criterion() not supported for this model, "
+                    "using existing loss function: %s", e
+                )
     elif hasattr(model, "_model") and hasattr(model._model, "to"):
         model._model.to(device)
     elif hasattr(model, "model") and hasattr(model.model, "to"):
