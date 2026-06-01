@@ -10,7 +10,7 @@ import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
 
-from dashboard.data_loader import DashboardData, EvaluationReport, ExperimentRun
+from data_loader import DashboardData, EvaluationReport, ExperimentRun
 
 # Distinct color palette for overlaid runs
 RUN_COLORS = [

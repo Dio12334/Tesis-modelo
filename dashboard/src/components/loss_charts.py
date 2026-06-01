@@ -7,7 +7,7 @@ using Plotly interactive charts.
 import streamlit as st
 import plotly.graph_objects as go
 
-from dashboard.data_loader import ExperimentRun
+from data_loader import ExperimentRun
 
 
 def render_loss_chart(run: ExperimentRun) -> None:

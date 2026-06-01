@@ -7,7 +7,7 @@ from typing import Optional
 
 import streamlit as st
 
-from dashboard.data_loader import DashboardData, ExperimentRun
+from data_loader import DashboardData, ExperimentRun
 
 
 def render_sidebar(data: DashboardData) -> Optional[ExperimentRun]:

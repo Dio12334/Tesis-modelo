@@ -10,7 +10,7 @@ from typing import Optional
 import plotly.figure_factory as ff
 import streamlit as st
 
-from dashboard.data_loader import EvaluationReport
+from data_loader import EvaluationReport
 
 
 def render_confusion_matrix(report: Optional[EvaluationReport]) -> None:
@@ -36,6 +36,12 @@ def render_confusion_matrix(report: Optional[EvaluationReport]) -> None:
     matrix = report.confusion_matrix
     class_names = report.class_names
 
+    # If matrix is (C+1)x(C+1), the last row/column is "background"
+    if len(matrix) == len(class_names) + 1:
+        display_names = class_names + ["background"]
+    else:
+        display_names = class_names
+
     # Check if confusion matrix is all zeros
     if all(cell == 0 for row in matrix for cell in row):
         st.info(
@@ -48,8 +54,8 @@ def render_confusion_matrix(report: Optional[EvaluationReport]) -> None:
     # Rows = ground truth, Columns = predicted
     fig = ff.create_annotated_heatmap(
         z=matrix,
-        x=class_names,
-        y=class_names,
+        x=display_names,
+        y=display_names,
         annotation_text=[[str(cell) for cell in row] for row in matrix],
         colorscale="Blues",
         showscale=True,

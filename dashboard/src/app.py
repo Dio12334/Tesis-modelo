@@ -11,20 +11,20 @@ from pathlib import Path
 
 import streamlit as st
 
-from dashboard.data_loader import load_all_data
-from dashboard.components.sidebar import render_sidebar
-from dashboard.components.metrics_overview import render_metrics_overview
-from dashboard.components.loss_charts import render_loss_chart, render_learning_rate_chart
-from dashboard.components.class_performance import render_class_performance
-from dashboard.components.confusion_matrix import render_confusion_matrix
-from dashboard.components.run_comparison import render_run_comparison
-from dashboard.components.config_display import render_config
-from dashboard.components.image_prediction_viewer import (
+from data_loader import load_all_data
+from components.sidebar import render_sidebar
+from components.metrics_overview import render_metrics_overview
+from components.loss_charts import render_loss_chart, render_learning_rate_chart
+from components.class_performance import render_class_performance
+from components.confusion_matrix import render_confusion_matrix
+from components.run_comparison import render_run_comparison
+from components.config_display import render_config
+from components.image_prediction_viewer import (
     render_image_prediction_viewer,
     ImageAnnotation,
     BoundingBox,
 )
-from dashboard.data_loader import DashboardData
+from data_loader import DashboardData
 from typing import Optional
 
 logger = logging.getLogger(__name__)
@@ -152,7 +152,15 @@ def main() -> None:
         ])
 
         with tab1:
-            render_metrics_overview(run_eval_report)
+            # Show metrics overview for each available split
+            run_reports_by_split = data.evaluation_reports_by_split.get(selected_run.run_id, {})
+            if run_reports_by_split and len(run_reports_by_split) > 1:
+                split_tabs = st.tabs([f"Metrics ({s})" for s in run_reports_by_split])
+                for split_tab, (split_name, split_report) in zip(split_tabs, run_reports_by_split.items()):
+                    with split_tab:
+                        render_metrics_overview(split_report)
+            else:
+                render_metrics_overview(run_eval_report)
             render_config(selected_run)
 
         with tab2:
@@ -160,21 +168,39 @@ def main() -> None:
             render_learning_rate_chart(selected_run)
 
         with tab3:
-            render_class_performance(run_eval_report)
+            # Show class performance for each available split
+            run_reports_by_split = data.evaluation_reports_by_split.get(selected_run.run_id, {})
+            if run_reports_by_split and len(run_reports_by_split) > 1:
+                split_tabs = st.tabs([f"Class Performance ({s})" for s in run_reports_by_split])
+                for split_tab, (split_name, split_report) in zip(split_tabs, run_reports_by_split.items()):
+                    with split_tab:
+                        render_class_performance(split_report)
+            else:
+                render_class_performance(run_eval_report)
 
         with tab4:
-            render_confusion_matrix(run_eval_report)
+            # Show confusion matrix for each available split
+            if run_reports_by_split and len(run_reports_by_split) > 1:
+                split_tabs = st.tabs([f"Confusion Matrix ({s})" for s in run_reports_by_split])
+                for split_tab, (split_name, split_report) in zip(split_tabs, run_reports_by_split.items()):
+                    with split_tab:
+                        render_confusion_matrix(split_report)
+            else:
+                render_confusion_matrix(run_eval_report)
 
         with tab5:
             render_run_comparison(data, [selected_run])
 
         with tab6:
-            # Sub-tabs for validation vs training predictions
+            # Sub-tabs for validation and test predictions
             class_names = None
             if run_eval_report:
                 class_names = run_eval_report.class_names
 
-            pred_tab_val, pred_tab_train = st.tabs(["Predictions (Val)", "Predictions (Train)"])
+            # Get per-run predictions for each split
+            run_test_preds = data.test_predictions_by_run.get(selected_run.run_id)
+
+            pred_tab_val, pred_tab_test = st.tabs(["Predictions (Val)", "Predictions (Test)"])
 
             with pred_tab_val:
                 val_annotations = _build_annotations(run_val_preds)
@@ -184,12 +210,12 @@ def main() -> None:
                     key_prefix="val",
                 )
 
-            with pred_tab_train:
-                train_annotations = _build_annotations(run_train_preds)
+            with pred_tab_test:
+                test_annotations = _build_annotations(run_test_preds)
                 render_image_prediction_viewer(
-                    annotations=train_annotations,
+                    annotations=test_annotations,
                     class_names=class_names,
-                    key_prefix="train",
+                    key_prefix="test",
                 )
 
     except Exception as e:

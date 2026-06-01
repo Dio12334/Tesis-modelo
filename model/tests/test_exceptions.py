@@ -90,7 +90,14 @@ class TestModelNotFoundError:
     def test_stores_attributes(self):
         err = ModelNotFoundError("resnet50", ["yolov6", "ssd_mobilenetv3"])
         assert err.model_name == "resnet50"
-        assert err.available_models == ["yolov6", "ssd_mobilenetv3"]
+        # available_models is sorted alphabetically
+        assert err.available_models == ["ssd_mobilenetv3", "yolov6"]
+        assert err.suggestion is None
+        assert err.cause is None
+
+    def test_available_models_sorted_alphabetically(self):
+        err = ModelNotFoundError("x", ["yolov6", "ssd_mobilenetv3", "yolo26"])
+        assert err.available_models == ["ssd_mobilenetv3", "yolo26", "yolov6"]
 
     def test_message_contains_model_info(self):
         err = ModelNotFoundError("resnet50", ["yolov6", "ssd_mobilenetv3"])
@@ -98,6 +105,41 @@ class TestModelNotFoundError:
         assert "resnet50" in msg
         assert "yolov6" in msg
         assert "ssd_mobilenetv3" in msg
+
+    def test_two_argument_constructor_backward_compatible(self):
+        # The original two-argument constructor still works without suggestion/cause.
+        err = ModelNotFoundError("resnet50", ["yolov6"])
+        msg = str(err)
+        assert "resnet50" in msg
+        assert "Did you mean" not in msg
+        assert "Underlying error" not in msg
+
+    def test_suggestion_appended_when_provided(self):
+        err = ModelNotFoundError(
+            "yolov7", ["yolov6", "ssd_mobilenetv3"], suggestion="yolov6"
+        )
+        assert err.suggestion == "yolov6"
+        msg = str(err)
+        assert "Did you mean: yolov6?" in msg
+
+    def test_cause_appended_when_provided(self):
+        err = ModelNotFoundError(
+            "yolov6", ["yolov6"], cause="missing CUDA dependency"
+        )
+        assert err.cause == "missing CUDA dependency"
+        msg = str(err)
+        assert "Underlying error: missing CUDA dependency" in msg
+
+    def test_suggestion_and_cause_together(self):
+        err = ModelNotFoundError(
+            "yolov7",
+            ["yolov6"],
+            suggestion="yolov6",
+            cause="boom",
+        )
+        msg = str(err)
+        assert "Did you mean: yolov6?" in msg
+        assert "Underlying error: boom" in msg
 
 
 class TestConfigurationError:

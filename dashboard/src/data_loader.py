@@ -72,11 +72,14 @@ class DashboardData:
     runs: list[ExperimentRun] = field(default_factory=list)
     evaluation_report: Optional[EvaluationReport] = None
     evaluation_reports: dict = field(default_factory=dict)  # run_id -> EvaluationReport
+    evaluation_reports_by_split: dict = field(default_factory=dict)  # run_id -> {split: EvaluationReport}
     best_model_metadata: Optional[dict] = None
     predictions_data: Optional[dict] = None
     train_predictions_data: Optional[dict] = None
+    test_predictions_data: Optional[dict] = None
     predictions_by_run: dict = field(default_factory=dict)  # run_id -> predictions dict
     train_predictions_by_run: dict = field(default_factory=dict)  # run_id -> train predictions dict
+    test_predictions_by_run: dict = field(default_factory=dict)  # run_id -> test predictions dict
     errors: list[str] = field(default_factory=list)
 
 
@@ -180,6 +183,17 @@ def load_best_model_metadata(filepath: Path) -> dict:
         return json.load(f)
 
 
+def _infer_split_from_filename(filename: str) -> str:
+    """Infer the evaluation split from the report filename."""
+    if filename.startswith("val"):
+        return "val"
+    elif filename.startswith("train"):
+        return "train"
+    elif filename.startswith("test"):
+        return "test"
+    return "val"  # default
+
+
 def load_all_data(results_dir: Path, checkpoints_dir: Path) -> DashboardData:
     """Scan directories and load all experiment data.
 
@@ -227,7 +241,13 @@ def load_all_data(results_dir: Path, checkpoints_dir: Path) -> DashboardData:
     if checkpoints_dir.exists() and checkpoints_dir.is_dir():
         # Also scan checkpoints for experiment run JSON files
         # (skip known non-run files)
-        SKIP_FILENAMES = {"evaluation_report.json", "best.json", "best_model.json"}
+        SKIP_FILENAMES = {
+            "evaluation_report.json", "best.json", "best_model.json",
+            "val_evaluation_report.json", "train_evaluation_report.json",
+            "test_evaluation_report.json", "val_inference.json",
+            "train_inference.json", "test_inference.json",
+            "validation_inference.json", "predictions.json",
+        }
         # Skip files inside run UUID subdirectories (those contain .pt files, not runs)
         checkpoint_json_files = sorted(checkpoints_dir.rglob("*.json"))
         existing_run_ids = {run.run_id for run in dashboard_data.runs}
@@ -251,12 +271,31 @@ def load_all_data(results_dir: Path, checkpoints_dir: Path) -> DashboardData:
 
         # Search for evaluation_report.json files and associate with runs
         eval_reports = list(checkpoints_dir.rglob("evaluation_report.json"))
+        # Also search for split-tagged report files (val_evaluation_report.json, etc.)
+        # Order: val first (preferred for dashboard display), then train, then test
+        for split_name in ("val", "train", "test"):
+            eval_reports.extend(
+                checkpoints_dir.rglob(f"{split_name}_evaluation_report.json")
+            )
         for eval_path in eval_reports:
             try:
                 report = load_evaluation_report(eval_path)
                 parent_name = eval_path.parent.name
                 if len(parent_name) == 36 and parent_name.count("-") == 4:
-                    dashboard_data.evaluation_reports[parent_name] = report
+                    # Store by split for multi-split display
+                    split_name = _infer_split_from_filename(eval_path.name)
+                    if parent_name not in dashboard_data.evaluation_reports_by_split:
+                        dashboard_data.evaluation_reports_by_split[parent_name] = {}
+                    dashboard_data.evaluation_reports_by_split[parent_name][split_name] = report
+
+                    # Only overwrite if no report exists yet for this run,
+                    # or if the existing report has empty metrics (e.g., test split
+                    # with no ground truth) and the new one has actual data.
+                    existing = dashboard_data.evaluation_reports.get(parent_name)
+                    if existing is None:
+                        dashboard_data.evaluation_reports[parent_name] = report
+                    elif not existing.metrics.get("per_class_ap") and report.metrics.get("per_class_ap"):
+                        dashboard_data.evaluation_reports[parent_name] = report
                 if dashboard_data.evaluation_report is None:
                     dashboard_data.evaluation_report = report
             except (json.JSONDecodeError, KeyError, TypeError, ValueError) as e:
@@ -285,6 +324,8 @@ def load_all_data(results_dir: Path, checkpoints_dir: Path) -> DashboardData:
         val_pred_files = list(checkpoints_dir.rglob("validation_inference.json"))
         if not val_pred_files:
             val_pred_files = list(checkpoints_dir.rglob("predictions.json"))
+        # Also search for split-tagged prediction files (val_inference.json)
+        val_pred_files.extend(checkpoints_dir.rglob("val_inference.json"))
         for pred_path in val_pred_files:
             try:
                 with open(pred_path, "r", encoding="utf-8") as f:
@@ -308,6 +349,20 @@ def load_all_data(results_dir: Path, checkpoints_dir: Path) -> DashboardData:
                     dashboard_data.train_predictions_by_run[parent_name] = pred_data
                 if dashboard_data.train_predictions_data is None:
                     dashboard_data.train_predictions_data = pred_data
+            except (json.JSONDecodeError, PermissionError):
+                pass
+
+        # Load per-image predictions (test) per run
+        test_pred_files = list(checkpoints_dir.rglob("test_inference.json"))
+        for pred_path in test_pred_files:
+            try:
+                with open(pred_path, "r", encoding="utf-8") as f:
+                    pred_data = json.load(f)
+                parent_name = pred_path.parent.name
+                if len(parent_name) == 36 and parent_name.count("-") == 4:
+                    dashboard_data.test_predictions_by_run[parent_name] = pred_data
+                if dashboard_data.test_predictions_data is None:
+                    dashboard_data.test_predictions_data = pred_data
             except (json.JSONDecodeError, PermissionError):
                 pass
     else:
