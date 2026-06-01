@@ -42,11 +42,18 @@ class ImageAnnotation:
 
 # Distinct colors per damage class (RGB tuples)
 CLASS_COLORS: dict[str, tuple[int, int, int]] = {
+    # Dataset Ninja raw class names
     "alligator crack": (255, 0, 0),       # Red
     "longitudinal crack": (0, 255, 0),     # Green
     "other corruption": (0, 0, 255),       # Blue
     "pothole": (255, 165, 0),              # Orange
     "transverse crack": (128, 0, 128),     # Purple
+    # Spanish taxonomy class names (from rdd2022_classes.yaml)
+    "bache": (255, 165, 0),               # Orange (pothole)
+    "fisura_longitudinal": (0, 255, 0),   # Green (longitudinal crack)
+    "fisura_transversal": (128, 0, 128),  # Purple (transverse crack)
+    "piel_de_cocodrilo": (255, 0, 0),     # Red (alligator crack)
+    "otro": (0, 0, 255),                  # Blue (other corruption)
 }
 
 # Fallback color for unknown classes
@@ -406,14 +413,15 @@ def render_image_prediction_viewer(
         st.image(pred_image, width="stretch")
 
     # --- Color legend ---
-    st.markdown("**Class Colors:**")
-    legend_cols = st.columns(len(class_names))
-    for i, cls_name in enumerate(class_names):
-        color = get_class_color(cls_name)
-        hex_color = f"#{color[0]:02x}{color[1]:02x}{color[2]:02x}"
-        with legend_cols[i]:
-            st.markdown(
-                f'<span style="color:{hex_color}; font-weight:bold;">■</span> '
-                f"{cls_name}",
-                unsafe_allow_html=True,
-            )
+    if class_names:
+        st.markdown("**Class Colors:**")
+        legend_cols = st.columns(len(class_names))
+        for i, cls_name in enumerate(class_names):
+            color = get_class_color(cls_name)
+            hex_color = f"#{color[0]:02x}{color[1]:02x}{color[2]:02x}"
+            with legend_cols[i]:
+                st.markdown(
+                    f'<span style="color:{hex_color}; font-weight:bold;">■</span> '
+                    f"{cls_name}",
+                    unsafe_allow_html=True,
+                )

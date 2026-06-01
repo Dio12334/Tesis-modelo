@@ -8,7 +8,7 @@ from typing import Optional
 
 import streamlit as st
 
-from dashboard.data_loader import EvaluationReport
+from data_loader import EvaluationReport
 
 
 def render_metrics_overview(report: Optional[EvaluationReport]) -> None:

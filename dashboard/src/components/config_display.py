@@ -5,7 +5,7 @@ rather than raw JSON, covering training, model, dataset, and augmentation config
 """
 
 import streamlit as st
-from dashboard.data_loader import ExperimentRun
+from data_loader import ExperimentRun
 
 
 def _render_key_value_pairs(data: dict, exclude_keys: set[str] | None = None) -> None:

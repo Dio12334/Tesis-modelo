@@ -9,7 +9,7 @@ from typing import Optional
 import plotly.graph_objects as go
 import streamlit as st
 
-from dashboard.data_loader import EvaluationReport
+from data_loader import EvaluationReport
 
 
 def render_class_performance(report: Optional[EvaluationReport]) -> None:

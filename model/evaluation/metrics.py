@@ -304,11 +304,15 @@ def compute_confusion_matrix(
     class_names: List[str],
     iou_threshold: float = 0.5,
     confidence_threshold: float = 0.5,
+    include_background: bool = True,
 ) -> np.ndarray:
     """Generate a confusion matrix showing predicted vs actual class distributions.
 
-    The matrix has dimensions C×C where C is the number of classes.
+    The matrix has dimensions (C+1)×(C+1) when include_background is True,
+    where the last row/column represents "background" (no match).
     Entry [i, j] represents ground truth class i predicted as class j.
+    The background row captures false positives (predictions with no GT match).
+    The background column captures missed detections (GT with no prediction match).
 
     Args:
         predictions: List of prediction dicts per image.
@@ -316,13 +320,18 @@ def compute_confusion_matrix(
         class_names: Ordered list of class names (defines matrix indices).
         iou_threshold: IoU threshold for matching predictions to ground truths.
         confidence_threshold: Minimum confidence for predictions.
+        include_background: If True, add a background row/column for unmatched
+            predictions (false positives) and missed ground truths.
 
     Returns:
-        Confusion matrix as numpy array of shape (C, C) with non-negative integers.
+        Confusion matrix as numpy array of shape (C+1, C+1) if include_background
+        else (C, C) with non-negative integers.
     """
     num_classes = len(class_names)
     class_to_idx = {name: idx for idx, name in enumerate(class_names)}
-    matrix = np.zeros((num_classes, num_classes), dtype=np.int64)
+    size = num_classes + 1 if include_background else num_classes
+    matrix = np.zeros((size, size), dtype=np.int64)
+    bg_idx = num_classes  # background index (last row/column)
 
     # Build ground truth lookup by image_id
     gt_by_image: Dict[str, List[dict]] = {}
@@ -359,11 +368,25 @@ def compute_confusion_matrix(
                     best_iou = iou
                     best_gt_idx = gt_idx
 
+            pred_class_idx = class_to_idx[pred_label]
+
             if best_iou >= iou_threshold and best_gt_idx >= 0:
                 gt_label = image_gts[best_gt_idx]["label"]
                 gt_class_idx = class_to_idx[gt_label]
-                pred_class_idx = class_to_idx[pred_label]
                 matrix[gt_class_idx, pred_class_idx] += 1
                 image_gts[best_gt_idx]["matched"] = True
+            elif include_background:
+                # False positive: prediction with no GT match -> background row
+                matrix[bg_idx, pred_class_idx] += 1
+
+    # Count missed ground truths (unmatched GT -> background column)
+    if include_background:
+        for image_gts in gt_by_image.values():
+            for gt_item in image_gts:
+                if not gt_item["matched"]:
+                    gt_label = gt_item["label"]
+                    if gt_label in class_to_idx:
+                        gt_class_idx = class_to_idx[gt_label]
+                        matrix[gt_class_idx, bg_idx] += 1
 
     return matrix
