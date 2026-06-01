@@ -160,19 +160,42 @@ class YOLO26Detector(BaseDetector):
     def _build_loss_fn(self) -> None:
         """Set up the loss computation from the Ultralytics model.
 
-        The Ultralytics YOLO model exposes a `criterion` attribute on the
-        underlying nn.Module (model.model) that can be used to compute
-        training loss. This method stores a reference to that loss function.
-        If the model does not have a criterion attribute, the loss will be
-        computed via the model's forward pass in training mode.
+        The Ultralytics YOLO model requires init_criterion() to be called
+        to set up the loss function. The criterion also needs the model's
+        hyperparameters (args) to include loss weights (box, cls, dfl).
         """
         if self._model is not None and hasattr(self._model, "model"):
             model_module = self._model.model
-            # Ultralytics models expose criterion for loss computation
-            if hasattr(model_module, "criterion") and model_module.criterion is not None:
+
+            # Ensure model.args has loss hyperparameters and is a namespace
+            from types import SimpleNamespace
+            if hasattr(model_module, "args"):
+                args = model_module.args
+                if isinstance(args, dict):
+                    args.setdefault("box", 7.5)
+                    args.setdefault("cls", 0.5)
+                    args.setdefault("dfl", 1.5)
+                    model_module.args = SimpleNamespace(**args)
+                elif isinstance(args, SimpleNamespace):
+                    if not hasattr(args, "box"):
+                        args.box = 7.5
+                    if not hasattr(args, "cls"):
+                        args.cls = 0.5
+                    if not hasattr(args, "dfl"):
+                        args.dfl = 1.5
+            else:
+                model_module.args = SimpleNamespace(box=7.5, cls=0.5, dfl=1.5)
+
+            # Initialize criterion via the model's init_criterion method
+            if hasattr(model_module, "init_criterion"):
+                try:
+                    self._loss_fn = model_module.init_criterion()
+                    model_module.criterion = self._loss_fn
+                except Exception:
+                    self._loss_fn = None
+            elif hasattr(model_module, "criterion") and model_module.criterion is not None:
                 self._loss_fn = model_module.criterion
             else:
-                # Fallback: loss will be computed via model forward in train mode
                 self._loss_fn = None
 
     def get_parameters(self) -> List["torch.nn.Parameter"]:
@@ -211,20 +234,20 @@ class YOLO26Detector(BaseDetector):
             batch = images
 
         # Ensure model is in training mode
-        self._model.model.train()
+        model_module = self._model.model
+        model_module.train()
 
-        # Prepare targets in the format expected by Ultralytics loss:
-        # Ultralytics expects a batch tensor of shape (N_total, 6) where each row is
-        # [batch_idx, class_id, x_center, y_center, width, height] (normalized)
-        # However, the exact format depends on the model's loss function.
-        # We use the model's forward pass in training mode which handles loss internally.
+        # Get model device
+        device = next(model_module.parameters()).device
+        batch = batch.to(device)
+
         img_h, img_w = batch.shape[2], batch.shape[3]
 
         # Build target tensor in Ultralytics format: [batch_idx, cls, x_c, y_c, w, h]
         target_list = []
         for batch_idx, target in enumerate(targets):
-            boxes = target["boxes"]  # (N, 4) xyxy format
-            labels = target["labels"]  # (N,)
+            boxes = target["boxes"].to(device)  # (N, 4) xyxy format
+            labels = target["labels"].to(device)  # (N,)
 
             if boxes.shape[0] == 0:
                 continue
@@ -237,7 +260,7 @@ class YOLO26Detector(BaseDetector):
             height = (y2 - y1) / img_h
 
             n = boxes.shape[0]
-            batch_indices = torch.full((n, 1), batch_idx, dtype=boxes.dtype, device=boxes.device)
+            batch_indices = torch.full((n, 1), batch_idx, dtype=boxes.dtype, device=device)
             cls_col = labels.float().unsqueeze(1)
 
             # Each row: [batch_idx, class, x_center, y_center, width, height]
@@ -251,37 +274,19 @@ class YOLO26Detector(BaseDetector):
 
         batch_targets = torch.cat(target_list, dim=0)
 
-        # Compute loss using the model's forward pass in training mode
-        # Ultralytics DetectionModel.forward() returns loss when targets are provided
-        # The model's loss method expects: preds from model forward, batch dict
-        model_module = self._model.model
-
-        # Run forward pass to get predictions (feature maps)
-        preds = model_module(batch)
-
-        # Compute loss using the model's criterion/loss function
-        if self._loss_fn is not None:
-            # Use the criterion directly
-            batch_dict = {"batch_idx": batch_targets[:, 0],
-                         "cls": batch_targets[:, 1],
-                         "bboxes": batch_targets[:, 2:]}
-            loss = self._loss_fn(preds, batch_dict)
-            if isinstance(loss, tuple):
-                # criterion returns (total_loss, individual_losses)
-                loss = loss[0]
-            elif isinstance(loss, dict):
-                loss = sum(loss.values())
-        else:
-            # Fallback: use model's built-in loss computation
-            # Ultralytics models compute loss when called with targets in train mode
-            batch_dict = {"img": batch, "batch_idx": batch_targets[:, 0],
-                         "cls": batch_targets[:, 1],
-                         "bboxes": batch_targets[:, 2:]}
-            loss = model_module.loss(batch, batch_dict)
-            if isinstance(loss, tuple):
-                loss = loss[0]
-            elif isinstance(loss, dict):
-                loss = sum(loss.values())
+        # Use model.loss() which handles forward + criterion + device internally
+        batch_dict = {
+            "img": batch,
+            "batch_idx": batch_targets[:, 0],
+            "cls": batch_targets[:, 1],
+            "bboxes": batch_targets[:, 2:],
+        }
+        loss = model_module.loss(batch_dict)
+        if isinstance(loss, tuple):
+            # Returns (loss_components_tensor, detached_losses)
+            loss = loss[0].sum()
+        elif isinstance(loss, dict):
+            loss = sum(loss.values())
 
         # Ensure loss is a scalar
         if loss.dim() > 0:
