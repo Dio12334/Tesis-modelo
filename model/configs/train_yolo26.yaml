@@ -21,7 +21,7 @@ training:
   early_stopping_patience: 25
   batch_size: 16
   num_workers: 4
-  use_amp: false
+  use_amp: true
   learning_rate: 0.0005
   optimizer: MuSGD
   weight_decay: 0.005
@@ -32,9 +32,9 @@ training:
   checkpoint_dir: ./checkpoints/yolo26
   log_interval: 10
   seed: 42
+  num_workers: 12
   augmentation:
     horizontal_flip: true
-    rotation_range: 10
     brightness_range: [0.8, 1.2]
 
   
