@@ -3,13 +3,14 @@ name: rdd2022_yolo26n
 model:
   type: yolo26
   config:
-    model_size: "m"
+    model_size: "n"
     input_size: 640
     num_classes: 5
     end2end: false
     confidence_threshold: 0.25
     iou_threshold: 0.5
-    pretrained_weights: "yolo26m.pt"
+    pretrained_weights: "yolo26n.pt"
+    freeze_layers: 16
 
 dataset:
   type: rdd2022
