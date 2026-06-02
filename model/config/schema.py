@@ -131,6 +131,13 @@ YOLO26_MODEL_CONFIG_SCHEMA: dict = {
         "pretrained_weights": {
             "type": "str",
         },
+        "freeze_backbone": {
+            "type": "bool",
+        },
+        "freeze_layers": {
+            "type": "int",
+            "min": 0,
+        },
     },
 }
 
