@@ -5,8 +5,11 @@ implementing the BaseDetector interface for seamless use within the
 framework's training and evaluation pipelines.
 """
 
+import logging
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Callable, List, Optional
+
+logger = logging.getLogger(__name__)
 
 from model.exceptions import ConfigurationError
 from model.models.registry import BaseDetector, ModelRegistry
@@ -94,9 +97,57 @@ class YOLO26Detector(BaseDetector):
             model_file = self.MODEL_FILE_MAP[self.model_size]
             self._model = ultralytics.YOLO(model_file)
 
-        # Unfreeze all parameters for fine-tuning
-        for param in self._model.model.parameters():
-            param.requires_grad = True
+        # Configure parameter freezing for transfer learning
+        freeze_backbone = config.get("freeze_backbone", False)
+        freeze_layers = config.get("freeze_layers", None)
+
+        # Validate freeze_layers does not exceed total layer count (requires loaded model)
+        if freeze_layers is not None and isinstance(freeze_layers, int) and freeze_layers >= 0:
+            model_module = self._model.model
+            if hasattr(model_module, "model") and hasattr(model_module.model, "__len__"):
+                total_layers = len(model_module.model)
+            else:
+                total_layers = self._DEFAULT_BACKBONE_LAYERS
+            if freeze_layers > total_layers:
+                raise ConfigurationError(
+                    [f"Invalid freeze_layers '{freeze_layers}'. "
+                     f"Must not exceed total layer count ({total_layers})"]
+                )
+
+        if freeze_backbone:
+            # Freeze all backbone layers, keep head trainable
+            backbone_end = self._get_backbone_layer_count()
+            frozen_count = 0
+            trainable_count = 0
+            for name, param in self._model.model.named_parameters():
+                if self._is_backbone_param(name, backbone_end):
+                    param.requires_grad = False
+                    frozen_count += 1
+                else:
+                    param.requires_grad = True
+                    trainable_count += 1
+            logger.info(
+                f"Backbone frozen (layers 0-{backbone_end - 1}): "
+                f"{frozen_count} params frozen, {trainable_count} params trainable"
+            )
+        elif freeze_layers is not None:
+            # Freeze first N layers
+            frozen_names = self._get_first_n_layer_params(freeze_layers)
+            trainable_count = 0
+            for name, param in self._model.model.named_parameters():
+                param.requires_grad = name not in frozen_names
+                if param.requires_grad:
+                    trainable_count += 1
+            logger.info(
+                f"First {freeze_layers} layers frozen: "
+                f"{len(frozen_names)} params frozen, {trainable_count} params trainable"
+            )
+        else:
+            # Default: all params trainable (current behavior)
+            for param in self._model.model.parameters():
+                param.requires_grad = True
+            total = sum(1 for _ in self._model.model.parameters())
+            logger.info(f"All {total} params trainable (no freeze config)")
 
         # Build the loss function for training
         self._build_loss_fn()
@@ -154,6 +205,29 @@ class YOLO26Detector(BaseDetector):
                     f"Must be a float in range [0.0, 1.0]"
                 )
 
+        # Validate freeze_backbone type (only if present)
+        if "freeze_backbone" in config:
+            freeze_backbone = config["freeze_backbone"]
+            if not isinstance(freeze_backbone, bool):
+                violations.append(
+                    f"Invalid freeze_backbone '{freeze_backbone}'. "
+                    f"Must be a boolean"
+                )
+
+        # Validate freeze_layers type and range (only if present)
+        if "freeze_layers" in config:
+            freeze_layers = config["freeze_layers"]
+            if not isinstance(freeze_layers, int) or isinstance(freeze_layers, bool):
+                violations.append(
+                    f"Invalid freeze_layers '{freeze_layers}'. "
+                    f"Must be a non-negative integer"
+                )
+            elif freeze_layers < 0:
+                violations.append(
+                    f"Invalid freeze_layers '{freeze_layers}'. "
+                    f"Must be a non-negative integer"
+                )
+
         if violations:
             raise ConfigurationError(violations)
 
@@ -197,6 +271,75 @@ class YOLO26Detector(BaseDetector):
                 self._loss_fn = model_module.criterion
             else:
                 self._loss_fn = None
+
+    # ------------------------------------------------------------------
+    # Backbone / head layer identification helpers
+    # ------------------------------------------------------------------
+
+    # Default backbone layer count for YOLO26 architectures.
+    # In Ultralytics YOLO models, the first 10 layers (indices 0-9) of the
+    # nn.Sequential at model.model.model form the backbone (feature extractor),
+    # while layers 10+ are the detection neck/head.
+    _DEFAULT_BACKBONE_LAYERS = 10
+
+    def _get_backbone_layer_count(self) -> int:
+        """Determine the number of backbone layers from the model structure.
+
+        Inspects the Ultralytics model's sequential layer list
+        (``self._model.model.model``) to find how many layers constitute the
+        backbone. If the internal structure is not available (e.g. in mocked
+        models), falls back to the class default of 10.
+
+        Returns:
+            Number of backbone layers (int).
+        """
+        model_module = self._model.model
+        # Ultralytics exposes the layer list at model.model.model (nn.Sequential)
+        if hasattr(model_module, "model") and hasattr(model_module.model, "__len__"):
+            total_layers = len(model_module.model)
+            # Backbone is the first ~10 layers; never exceed total
+            return min(self._DEFAULT_BACKBONE_LAYERS, total_layers)
+        # Fallback for mock/test structures where model.model is the Sequential
+        return self._DEFAULT_BACKBONE_LAYERS
+
+    @staticmethod
+    def _is_backbone_param(name: str, backbone_end: int) -> bool:
+        """Check if a named parameter belongs to backbone layers.
+
+        Parameters follow the naming pattern ``model.<layer_idx>.<sublayer>.<kind>``
+        (e.g. ``model.0.conv.weight``, ``model.9.bn.bias``). A parameter belongs
+        to the backbone when its layer index is strictly less than *backbone_end*.
+
+        Args:
+            name: Fully-qualified parameter name from ``named_parameters()``.
+            backbone_end: Layer index where backbone ends (exclusive).
+
+        Returns:
+            True if the parameter belongs to a backbone layer, False otherwise.
+        """
+        parts = name.split(".")
+        if len(parts) >= 2 and parts[0] == "model" and parts[1].isdigit():
+            layer_idx = int(parts[1])
+            return layer_idx < backbone_end
+        return False
+
+    def _get_first_n_layer_params(self, n: int) -> set:
+        """Return parameter names for the first N layers of the model.
+
+        Iterates over all named parameters and collects those whose layer
+        index (extracted from the name prefix) is in ``[0, n)``.
+
+        Args:
+            n: Number of initial layers whose parameters to collect.
+
+        Returns:
+            A set of parameter name strings belonging to the first N layers.
+        """
+        frozen_names: set = set()
+        for name, _ in self._model.model.named_parameters():
+            if self._is_backbone_param(name, backbone_end=n):
+                frozen_names.add(name)
+        return frozen_names
 
     def get_parameters(self) -> List["torch.nn.Parameter"]:
         """Return trainable model parameters for optimizer construction.
