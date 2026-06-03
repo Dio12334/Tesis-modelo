@@ -52,9 +52,10 @@ class RDD2022TorchDataset(torch.utils.data.Dataset):
         self._input_size = input_size
         self._class_names = dataset.get_class_names()
         self._augmentation = augmentation  # augmentation.Compose pipeline or None
-        # Map class names to 1-indexed labels (0 = background in torchvision)
+        # Map class names to 0-indexed labels (YOLO models don't use a
+        # background class; valid indices are 0..num_classes-1)
         self._class_to_idx = {
-            name: idx + 1 for idx, name in enumerate(self._class_names)
+            name: idx for idx, name in enumerate(self._class_names)
         }
         self._transform = T.Compose([
             T.Resize((input_size, input_size)),

@@ -19,7 +19,7 @@ import argparse
 import json
 import logging
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Callable, Dict, List, Optional, Tuple
 
 import numpy as np
 import torch
@@ -557,7 +557,7 @@ def _load_dataset(dataset: "RDD2022Dataset", path: Path) -> None:
 
 def load_split(
     config: dict,
-) -> Tuple["RDD2022Dataset", List[str], Dict[int, str]]:
+) -> Tuple["RDD2022Dataset", List[str], Dict[int, str], Optional[Callable]]:
     """Load the dataset and produce the requested evaluation partition.
 
     The dataset path is taken from ``dataset.path`` and its existence is
@@ -685,7 +685,7 @@ def load_split(
                 class_names,
             )
 
-    idx_to_class = {idx + 1: name for idx, name in enumerate(class_names)}
+    idx_to_class = {idx: name for idx, name in enumerate(class_names)}
 
     # Return the target_mapper's map_class method as a label remapper if available.
     label_mapper = target_mapper.map_class if target_mapper else None

@@ -134,7 +134,7 @@ def _orchestration_patches(fake_detector=None, num_images=2):
 
     fake_split = _FakeSplit(num_images)
     class_names = ["crack", "pothole"]
-    idx_to_class = {1: "crack", 2: "pothole"}
+    idx_to_class = {0: "crack", 1: "pothole"}
 
     # Fake metrics result
     fake_metrics = {
@@ -180,7 +180,7 @@ def _orchestration_patches(fake_detector=None, num_images=2):
         ),
         "load_split": patch(
             "model.training.evaluate_detection.load_split",
-            return_value=(fake_split, class_names, idx_to_class),
+            return_value=(fake_split, class_names, idx_to_class, None),
         ),
         "run_inference": patch(
             "model.training.evaluate_detection.run_inference",
