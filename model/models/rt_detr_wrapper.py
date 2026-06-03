@@ -89,9 +89,25 @@ class RT_DETR_Detector(BaseDetector):
             model_file = self.MODEL_FILE_MAP[self.model_size]
             self._model = RTDETR(model_file)
 
-        # Unfreeze all parameters for fine-tuning
-        for param in self._model.model.parameters():
-            param.requires_grad = True
+        # Apply freeze layers logic (or default: all trainable)
+        freeze_layers = config.get("freeze_layers", None)
+
+        if freeze_layers is not None:
+            # Validate against actual model layer count
+            total_layers = self._get_total_layer_count()
+            if freeze_layers > total_layers:
+                raise ConfigurationError(
+                    [f"Invalid freeze_layers '{freeze_layers}'. "
+                     f"Must not exceed total layer count ({total_layers})"]
+                )
+            # Freeze first N layers
+            frozen_names = self._get_first_n_layer_params(freeze_layers)
+            for name, param in self._model.model.named_parameters():
+                param.requires_grad = name not in frozen_names
+        else:
+            # Default: all params trainable (existing behavior)
+            for param in self._model.model.parameters():
+                param.requires_grad = True
 
         # Build the loss function for training
         self._build_loss_fn()
@@ -149,8 +165,61 @@ class RT_DETR_Detector(BaseDetector):
                     f"Must be a float in range [0.0, 1.0]"
                 )
 
+        # Validate freeze_layers type and value (only if present)
+        if "freeze_layers" in config:
+            freeze_layers = config["freeze_layers"]
+            if not isinstance(freeze_layers, int) or isinstance(freeze_layers, bool):
+                violations.append(
+                    f"Invalid freeze_layers '{freeze_layers}'. "
+                    f"Must be a non-negative integer"
+                )
+            elif freeze_layers < 0:
+                violations.append(
+                    f"Invalid freeze_layers '{freeze_layers}'. "
+                    f"Must be a non-negative integer"
+                )
+
         if violations:
             raise ConfigurationError(violations)
+
+    @staticmethod
+    def _is_backbone_param(name: str, backbone_end: int) -> bool:
+        """Determine if a named parameter belongs to a layer below the freeze threshold.
+
+        Parses the ``model.<layer_idx>.<sublayer>.<kind>`` naming pattern used by
+        the Ultralytics sequential layer structure.
+
+        Args:
+            name: The parameter name from ``model.named_parameters()``.
+            backbone_end: The number of initial layers to consider as backbone
+                (i.e., the freeze_layers value).
+
+        Returns:
+            True if the parameter belongs to a layer with index < backbone_end.
+        """
+        parts = name.split(".")
+        if len(parts) >= 2 and parts[0] == "model" and parts[1].isdigit():
+            layer_idx = int(parts[1])
+            return layer_idx < backbone_end
+        return False
+
+    def _get_first_n_layer_params(self, n: int) -> set:
+        """Collect all parameter names belonging to the first N layers.
+
+        Iterates over the model's named parameters and identifies those
+        belonging to layers with index < n using ``_is_backbone_param``.
+
+        Args:
+            n: Number of initial layers whose parameters should be collected.
+
+        Returns:
+            A set of parameter name strings for O(1) membership lookup.
+        """
+        frozen_names: set = set()
+        for name, _ in self._model.model.named_parameters():
+            if self._is_backbone_param(name, backbone_end=n):
+                frozen_names.add(name)
+        return frozen_names
 
     def _build_loss_fn(self) -> None:
         """Set up the loss computation from the Ultralytics model.
@@ -215,6 +284,20 @@ class RT_DETR_Detector(BaseDetector):
                 self._loss_fn = model_module.criterion
             else:
                 self._loss_fn = None
+
+    def _get_total_layer_count(self) -> int:
+        """Return the total number of freezable sequential layers.
+
+        Inspects `_model.model.model` for a sequence with `__len__`.
+        Falls back to 0 if the model structure is unexpected.
+
+        Returns:
+            Integer count of top-level sequential modules, or 0 if unavailable.
+        """
+        model_module = self._model.model
+        if hasattr(model_module, "model") and hasattr(model_module.model, "__len__"):
+            return len(model_module.model)
+        return 0
 
     def get_config_schema(self) -> dict:
         """Return the configuration schema for RT-DETR.

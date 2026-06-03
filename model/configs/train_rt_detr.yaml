@@ -8,6 +8,7 @@ model:
     num_classes: 5
     confidence_threshold: 0.25
     iou_threshold: 0.7
+    # freeze_layers: 10  # Number of initial layers to freeze (0 to total_layers). Optional.
 
 dataset:
   type: rdd2022
