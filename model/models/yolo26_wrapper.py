@@ -97,6 +97,9 @@ class YOLO26Detector(BaseDetector):
             model_file = self.MODEL_FILE_MAP[self.model_size]
             self._model = ultralytics.YOLO(model_file)
 
+        # Reshape detection head if pretrained model has different num_classes
+        self._reshape_head_if_needed()
+
         # Configure parameter freezing for transfer learning
         freeze_backbone = config.get("freeze_backbone", False)
         freeze_layers = config.get("freeze_layers", None)
@@ -230,6 +233,119 @@ class YOLO26Detector(BaseDetector):
 
         if violations:
             raise ConfigurationError(violations)
+
+    def _reshape_head_if_needed(self) -> None:
+        """Reshape the detection head to match the configured num_classes.
+
+        Pretrained YOLO weights (e.g., COCO with 80 classes) have classification
+        layers sized for their original class count. This method rebuilds the
+        classification convolution layers (cv3 and one2one_cv3) in the Detect
+        head to output predictions for self.num_classes instead.
+
+        The box regression layers (cv2) are left unchanged since they are
+        class-agnostic.
+        """
+        model_module = self._model.model
+        model_nc = getattr(model_module, "nc", None)
+
+        # Skip if nc is not a real integer (e.g., mocked model) or already matches
+        if not isinstance(model_nc, int) or model_nc == self.num_classes:
+            return
+
+        logger.info(
+            f"Reshaping detection head: {model_nc} classes -> {self.num_classes} classes"
+        )
+
+        # Update the model-level nc attribute
+        model_module.nc = self.num_classes
+
+        # Get the detection head (last layer in the sequential model)
+        head = model_module.model[-1]
+        head.nc = self.num_classes
+        head.no = self.num_classes + head.reg_max * 4
+
+        # Determine input channels per scale from existing cv3 layers
+        # Each cv3[i] is a Sequential; the first sub-module's first layer
+        # reveals the input channel count for that scale.
+        ch = []
+        for cv3_scale in head.cv3:
+            # Navigate into the Sequential to find the first Conv/DWConv input channels
+            first_module = cv3_scale[0]
+            if hasattr(first_module, '__getitem__'):
+                # Nested Sequential (DWConv path): first_module[0] is DWConv
+                inp_ch = self._get_input_channels(first_module[0])
+            else:
+                inp_ch = self._get_input_channels(first_module)
+            ch.append(inp_ch)
+
+        # Rebuild classification layers (cv3) for the new num_classes
+        # Use the same architecture as the Detect head in Ultralytics
+        from ultralytics.nn.modules.conv import Conv, DWConv
+
+        c3 = max(ch[0], min(self.num_classes, 100))
+        legacy = getattr(head, "legacy", False)
+
+        if legacy:
+            new_cv3 = torch.nn.ModuleList(
+                torch.nn.Sequential(
+                    Conv(x, c3, 3), Conv(c3, c3, 3),
+                    torch.nn.Conv2d(c3, self.num_classes, 1)
+                ) for x in ch
+            )
+        else:
+            new_cv3 = torch.nn.ModuleList(
+                torch.nn.Sequential(
+                    torch.nn.Sequential(DWConv(x, x, 3), Conv(x, c3, 1)),
+                    torch.nn.Sequential(DWConv(c3, c3, 3), Conv(c3, c3, 1)),
+                    torch.nn.Conv2d(c3, self.num_classes, 1),
+                )
+                for x in ch
+            )
+
+        head.cv3 = new_cv3
+
+        # Also rebuild one2one_cv3 if end2end mode is available
+        if hasattr(head, "one2one_cv3") and head.one2one_cv3 is not None:
+            import copy
+            head.one2one_cv3 = copy.deepcopy(new_cv3)
+
+        # Re-initialize detection head biases to stabilize early training.
+        # Without this, the freshly created cv3 layers have zero bias, causing
+        # all anchors to predict ~50% confidence and producing enormous loss.
+        if hasattr(head, "bias_init") and hasattr(head, "stride") and head.stride is not None:
+            try:
+                # stride must be populated for bias_init to work
+                if head.stride.sum() > 0:
+                    head.bias_init()
+                    logger.info("Detection head biases re-initialized")
+            except Exception as e:
+                logger.debug("Could not re-initialize head biases: %s", e)
+
+        logger.info(
+            f"Detection head reshaped successfully: "
+            f"cv3 rebuilt for {self.num_classes} classes with ch={ch}"
+        )
+
+    @staticmethod
+    def _get_input_channels(module) -> int:
+        """Extract input channel count from a Conv/DWConv/nn.Conv2d module.
+
+        Args:
+            module: A convolutional module.
+
+        Returns:
+            Number of input channels.
+        """
+        if hasattr(module, "conv"):
+            # Ultralytics Conv wrapper stores the actual nn.Conv2d as .conv
+            return module.conv.in_channels
+        elif hasattr(module, "in_channels"):
+            return module.in_channels
+        else:
+            # Fallback: try first child
+            for child in module.children():
+                return YOLO26Detector._get_input_channels(child)
+            raise RuntimeError(f"Cannot determine input channels from {type(module)}")
 
     def _build_loss_fn(self) -> None:
         """Set up the loss computation from the Ultralytics model.
@@ -557,38 +673,94 @@ class YOLO26Detector(BaseDetector):
                 f"Checkpoint not found: {checkpoint_path}"
             )
 
-        YOLO = ultralytics.YOLO
-
+        # Try loading as a framework-saved state dict first (preferred path).
+        # This preserves the current model architecture (including reshaped head).
         try:
-            # Try loading as an Ultralytics native checkpoint first.
-            # YOLO(path) handles both native Ultralytics .pt files and
-            # standard PyTorch state dicts saved by the framework.
-            self._model = YOLO(str(checkpoint_path))
-        except Exception as exc:
-            # If direct YOLO loading fails, try loading as a framework-saved
-            # state dict into the existing model.
-            try:
-                if self._model is None:
-                    # Initialize a base model from the configured size
-                    model_file = self.MODEL_FILE_MAP[self.model_size]
-                    self._model = YOLO(model_file)
-                state_dict = torch.load(
-                    str(checkpoint_path), map_location="cpu"
-                )
-                if isinstance(state_dict, dict) and "model_state_dict" in state_dict:
-                    self._model.model.load_state_dict(
-                        state_dict["model_state_dict"]
+            state_dict = torch.load(
+                str(checkpoint_path), map_location="cpu"
+            )
+            if isinstance(state_dict, dict) and "model_state_dict" in state_dict:
+                saved_state = state_dict["model_state_dict"]
+
+                # Handle key prefix mismatches caused by torch.compile()
+                # or different model wrapping.
+                model_keys = set(self._model.model.state_dict().keys())
+                saved_keys = set(saved_state.keys())
+
+                if model_keys and saved_keys and not (model_keys & saved_keys):
+                    sample_saved_key = next(iter(saved_keys))
+
+                    if sample_saved_key.startswith("_orig_mod."):
+                        saved_state = {
+                            k.removeprefix("_orig_mod."): v
+                            for k, v in saved_state.items()
+                        }
+                    else:
+                        sample_model_key = next(iter(model_keys))
+                        if sample_model_key.startswith("model.") and not sample_saved_key.startswith("model."):
+                            saved_state = {f"model.{k}": v for k, v in saved_state.items()}
+                        elif not sample_model_key.startswith("model.") and sample_saved_key.startswith("model."):
+                            saved_state = {k.removeprefix("model."): v for k, v in saved_state.items()}
+
+                # Check for shape mismatches before loading
+                model_state = self._model.model.state_dict()
+                mismatched = []
+                for key in saved_state:
+                    if key in model_state and saved_state[key].shape != model_state[key].shape:
+                        mismatched.append(
+                            f"  {key}: checkpoint={list(saved_state[key].shape)} "
+                            f"vs model={list(model_state[key].shape)}"
+                        )
+
+                if mismatched:
+                    logger.warning(
+                        "Shape mismatches during checkpoint loading "
+                        "(these layers will use random weights):\n%s",
+                        "\n".join(mismatched),
                     )
-                else:
-                    # Re-raise the original error if it's not a recognized format
-                    raise
-            except (FileNotFoundError, RuntimeError):
-                raise
-            except Exception:
-                raise RuntimeError(
-                    f"Failed to load checkpoint '{checkpoint_path}': "
-                    f"file is corrupted or not a valid checkpoint format"
-                ) from exc
+
+                result = self._model.model.load_state_dict(saved_state, strict=False)
+
+                # Report missing and unexpected keys
+                if result.missing_keys:
+                    logger.warning(
+                        "Checkpoint missing %d keys (using initialized weights): %s",
+                        len(result.missing_keys),
+                        result.missing_keys[:10],
+                    )
+                if result.unexpected_keys:
+                    logger.warning(
+                        "Checkpoint has %d unexpected keys (ignored): %s",
+                        len(result.unexpected_keys),
+                        result.unexpected_keys[:10],
+                    )
+
+                logger.info("Loaded framework checkpoint: %s", checkpoint_path)
+                return
+            else:
+                logger.debug(
+                    "Checkpoint is not framework format (no 'model_state_dict' key), "
+                    "trying Ultralytics native format..."
+                )
+        except Exception as e:
+            logger.warning(
+                "Failed to load checkpoint as framework state_dict: %s. "
+                "Trying Ultralytics native format...", e
+            )
+
+        # Fallback: try loading as an Ultralytics native checkpoint.
+        # This replaces the model entirely, so we need to reshape again.
+        YOLO = ultralytics.YOLO
+        try:
+            self._model = YOLO(str(checkpoint_path))
+            # Re-apply head reshape if the loaded model has wrong nc
+            self._reshape_head_if_needed()
+            logger.info("Loaded Ultralytics checkpoint: %s", checkpoint_path)
+        except Exception as exc:
+            raise RuntimeError(
+                f"Failed to load checkpoint '{checkpoint_path}': "
+                f"file is corrupted or not a valid checkpoint format"
+            ) from exc
 
     def save_checkpoint(self, path: Path) -> None:
         """Save model weights to a checkpoint file.
@@ -603,9 +775,15 @@ class YOLO26Detector(BaseDetector):
 
         if self._model is not None and hasattr(self._model, "model"):
             # Save the underlying PyTorch model state dict in a format
-            # that can be reloaded by both load_checkpoint and torch.load
+            # that can be reloaded by both load_checkpoint and torch.load.
+            # Strip "_orig_mod." prefix that torch.compile() adds, so
+            # checkpoints are always saved with clean key names.
+            raw_state = self._model.model.state_dict()
+            clean_state = {
+                k.removeprefix("_orig_mod."): v for k, v in raw_state.items()
+            }
             torch.save(
-                {"model_state_dict": self._model.model.state_dict()},
+                {"model_state_dict": clean_state},
                 str(checkpoint_path),
             )
         elif self._model is not None:

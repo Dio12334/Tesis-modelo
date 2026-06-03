@@ -178,7 +178,7 @@ class TestProperty16SplitSelection:
         fake_cls, created = _make_fake_dataset_class()
 
         with patch("model.training.evaluate_detection.RDD2022Dataset", fake_cls):
-            split_dataset, class_names, idx_to_class = load_split(config)
+            split_dataset, class_names, idx_to_class, _label_mapper = load_split(config)
 
         # Exactly one source dataset is constructed and loaded from dataset.path.
         assert len(created) == 1
@@ -187,9 +187,9 @@ class TestProperty16SplitSelection:
         # The country filter is passed through to the dataset constructor.
         assert source.country_filter == country_filter
 
-        # Class-name mapping is derived from the loaded source dataset, one-based.
+        # Class-name mapping is derived from the loaded source dataset, zero-based.
         assert class_names == ["crack", "pothole"]
-        assert idx_to_class == {1: "crack", 2: "pothole"}
+        assert idx_to_class == {0: "crack", 1: "pothole"}
 
         expected_val = 0.2 if val_split is None else float(val_split)
         expected_seed = 42 if seed is None else int(seed)
@@ -227,7 +227,7 @@ class TestProperty16SplitSelection:
         fake_cls, created = _make_fake_dataset_class()
 
         with patch("model.training.evaluate_detection.RDD2022Dataset", fake_cls):
-            split_dataset, _, _ = load_split(config)
+            split_dataset, _, _, _ = load_split(config)
 
         source = created[0]
         if split == "train":
@@ -270,7 +270,7 @@ class TestSplitSelectionRealSample:
         train_ds, _ = self._expected_partitions(val_split=0.2, seed=42)
         config = _config("train", val_split=0.2, seed=42)
 
-        split_dataset, _, _ = load_split(config)
+        split_dataset, _, _, _ = load_split(config)
 
         assert len(split_dataset) == len(train_ds)
         got = [str(a.image_path) for a in split_dataset.get_annotations()]
@@ -282,7 +282,7 @@ class TestSplitSelectionRealSample:
         _, val_ds = self._expected_partitions(val_split=0.2, seed=42)
         config = _config("val", val_split=0.2, seed=42)
 
-        split_dataset, _, _ = load_split(config)
+        split_dataset, _, _, _ = load_split(config)
 
         assert len(split_dataset) == len(val_ds)
         got = [str(a.image_path) for a in split_dataset.get_annotations()]
@@ -295,7 +295,7 @@ class TestSplitSelectionRealSample:
         test_source.load(SAMPLE_DIR)
         config = _config("test")
 
-        split_dataset, _, _ = load_split(config)
+        split_dataset, _, _, _ = load_split(config)
 
         assert len(split_dataset) == len(test_source)
         got = sorted(str(a.image_path) for a in split_dataset.get_annotations())
@@ -314,9 +314,9 @@ class TestSplitSelectionRealSample:
         source.load(SAMPLE_DIR)
         total = len(source)
 
-        train_ds, _, _ = load_split(_config("train", val_split=0.2, seed=42))
+        train_ds, _, _, _ = load_split(_config("train", val_split=0.2, seed=42))
         # load_split is deterministic, so re-running for val yields the complement.
-        val_ds, _, _ = load_split(_config("val", val_split=0.2, seed=42))
+        val_ds, _, _, _ = load_split(_config("val", val_split=0.2, seed=42))
 
         train_paths = {str(a.image_path) for a in train_ds.get_annotations()}
         val_paths = {str(a.image_path) for a in val_ds.get_annotations()}
