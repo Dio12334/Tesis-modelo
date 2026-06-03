@@ -5,8 +5,11 @@ implementing the BaseDetector interface for seamless use within the
 framework's training and evaluation pipelines.
 """
 
+import logging
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Callable, List, Optional
+
+logger = logging.getLogger(__name__)
 
 from model.exceptions import ConfigurationError
 from model.models.registry import BaseDetector, ModelRegistry
@@ -104,6 +107,13 @@ class RT_DETR_Detector(BaseDetector):
             frozen_names = self._get_first_n_layer_params(freeze_layers)
             for name, param in self._model.model.named_parameters():
                 param.requires_grad = name not in frozen_names
+            total_params = sum(1 for _ in self._model.model.parameters())
+            frozen_count = len(frozen_names)
+            trainable_count = total_params - frozen_count
+            logger.info(
+                f"Freeze layers: {freeze_layers}/{total_layers} layers frozen "
+                f"({frozen_count} params frozen, {trainable_count} trainable)"
+            )
         else:
             # Default: all params trainable (existing behavior)
             for param in self._model.model.parameters():
