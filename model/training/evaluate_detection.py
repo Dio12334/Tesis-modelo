@@ -557,7 +557,7 @@ def _load_dataset(dataset: "RDD2022Dataset", path: Path) -> None:
 
 def load_split(
     config: dict,
-) -> Tuple["RDD2022Dataset", List[str], Dict[int, str], Optional[Callable]]:
+) -> Tuple["RDD2022Dataset", List[str], Dict[int, str], List[str]]:
     """Load the dataset and produce the requested evaluation partition.
 
     The dataset path is taken from ``dataset.path`` and its existence is
@@ -589,10 +589,14 @@ def load_split(
         config: The merged, validated configuration dict.
 
     Returns:
-        A ``(split_dataset, class_names, idx_to_class)`` tuple where
-        ``split_dataset`` is the :class:`RDD2022Dataset` partition to evaluate,
-        ``class_names`` is the sorted list of class-name strings, and
-        ``idx_to_class`` maps each one-based label index to its class name.
+        A ``(split_dataset, class_names, idx_to_class, display_class_names)``
+        tuple where ``split_dataset`` is the :class:`RDD2022Dataset` partition
+        to evaluate, ``class_names`` is the sorted list of raw English
+        class-name strings (the canonical training index space),
+        ``idx_to_class`` maps each label index to its English class name, and
+        ``display_class_names`` is a parallel list whose ``i``-th entry is the
+        Spanish display name for ``class_names[i]`` when a ``class_mapping``
+        config is provided (otherwise ``display_class_names == class_names``).
 
     Raises:
         FileNotFoundError: If ``dataset.path`` does not exist (raised before
@@ -667,30 +671,51 @@ def load_split(
             except (json.JSONDecodeError, KeyError, TypeError):
                 pass
 
-    # If a class_mapping config is provided, use the target taxonomy as the
-    # authoritative class list. This ensures the idx_to_class mapping matches
-    # the model's training labels (e.g., model outputs index 1 = first taxonomy
-    # class). The TargetMapper also remaps ground-truth labels from the raw
-    # dataset class names to the model's taxonomy.
+    # The canonical class-index space is the sorted list of raw English
+    # labels produced by RDD2022Dataset.get_class_names(); this is identical
+    # to the index space the training pipeline builds in
+    # train_detection.py:RDD2022TorchDataset._class_to_idx, so predictions
+    # emitted by the trained detector are positionally aligned with these
+    # class names. We must NOT override class_names with the YAML taxonomy
+    # (Spanish, declared order) -- doing so would scramble every metric.
+    #
+    # When a class_mapping config is provided, the YAML taxonomy is used
+    # purely for display rendering: a parallel display_class_names list is
+    # produced via TargetMapper.map_class so downstream consumers can render
+    # Spanish labels on confusion-matrix axes / report tables without
+    # disturbing the canonical (training-aligned) index space.
     _, class_mapping_path = _get_nested(config, ("dataset", "class_mapping"))
-    target_mapper = None
+    display_class_names: List[str] = list(class_names)
     if class_mapping_path and Path(str(class_mapping_path)).exists():
         from model.datasets.target_mapper import TargetMapper
         target_mapper = TargetMapper(Path(str(class_mapping_path)), strict=False)
         if target_mapper.taxonomy:
-            class_names = target_mapper.taxonomy
+            mapped: List[str] = []
+            for name in class_names:
+                try:
+                    mapped.append(target_mapper.map_class(name))
+                except Exception:
+                    # Fall back to the canonical English name when mapping
+                    # fails for a particular raw label; logged at WARNING so
+                    # the gap is visible without aborting evaluation.
+                    logger.warning(
+                        "TargetMapper has no entry for raw label %r; "
+                        "using canonical name in display_class_names",
+                        name,
+                    )
+                    mapped.append(name)
+            display_class_names = mapped
             logger.info(
-                "Using taxonomy from class_mapping (%d classes): %s",
+                "Display class names derived from class_mapping (%d classes): "
+                "english=%s display=%s",
                 len(class_names),
                 class_names,
+                display_class_names,
             )
 
     idx_to_class = {idx: name for idx, name in enumerate(class_names)}
 
-    # Return the target_mapper's map_class method as a label remapper if available.
-    label_mapper = target_mapper.map_class if target_mapper else None
-
-    return split_dataset, class_names, idx_to_class, label_mapper
+    return split_dataset, class_names, idx_to_class, display_class_names
 
 
 def normalize_box(
@@ -847,7 +872,7 @@ def _as_float(value) -> float:
     return float(value)
 
 
-def _build_ground_truth(annotation, image_id: str, input_size: int, label_mapper=None) -> dict:
+def _build_ground_truth(annotation, image_id: str, input_size: int) -> dict:
     """Build the normalized ground-truth entry for a single annotation.
 
     Produces exactly one ground-truth entry per annotation (Req 7.1). Each
@@ -861,12 +886,12 @@ def _build_ground_truth(annotation, image_id: str, input_size: int, label_mapper
         annotation: The dataset :class:`~model.datasets.base.Annotation`.
         image_id: The image identifier (``str(annotation.image_path)``).
         input_size: The inference input size used for scale normalization.
-        label_mapper: Optional callable that maps raw class labels to the
-            model's taxonomy. If None, raw labels are used as-is.
 
     Returns:
         A ground-truth dict with ``image_id``, normalized ``boxes``, and
-        class-name ``labels``.
+        class-name ``labels``. Labels are the raw English class names
+        emitted by the dataset and live in the canonical (training-aligned)
+        index space; no remapping is applied.
     """
     gt_boxes: List[List[float]] = []
     gt_labels: List[str] = []
@@ -877,13 +902,7 @@ def _build_ground_truth(annotation, image_id: str, input_size: int, label_mapper
         if clamped is None:
             continue
         gt_boxes.append(clamped)
-        label = bbox.class_label
-        if label_mapper is not None:
-            try:
-                label = label_mapper(label)
-            except Exception:
-                pass  # Keep original label if mapping fails
-        gt_labels.append(label)
+        gt_labels.append(bbox.class_label)
     return {"image_id": image_id, "boxes": gt_boxes, "labels": gt_labels}
 
 
@@ -984,7 +1003,6 @@ def run_inference(
     device,
     input_size: int,
     idx_to_class: Dict[int, str],
-    label_mapper=None,
 ) -> Tuple[List[dict], List[dict], List[str]]:
     """Run inference over a split, keeping predictions and GTs 1:1 aligned.
 
@@ -1054,7 +1072,7 @@ def run_inference(
         image_id = str(annotation.image_path)
 
         # Req 7.1: exactly one ground-truth entry per annotation, in order.
-        ground_truths.append(_build_ground_truth(annotation, image_id, input_size, label_mapper))
+        ground_truths.append(_build_ground_truth(annotation, image_id, input_size))
 
         pred_entry: Optional[dict] = None
 
@@ -1246,6 +1264,7 @@ def assemble_report(
     metrics: dict,
     confusion_matrix: List[List[int]],
     errors: List[str],
+    display_class_names: Optional[List[str]] = None,
 ) -> dict:
     """Assemble the Evaluation_Report dict, validating required metric fields.
 
@@ -1340,6 +1359,11 @@ def assemble_report(
         "num_images": num_images,
         "num_classes": num_classes,
         "class_names": class_names,
+        "display_class_names": (
+            list(display_class_names)
+            if display_class_names is not None
+            else list(class_names)
+        ),
         "confidence_threshold": confidence_threshold,
         "iou_threshold": iou_threshold,
         "metrics": report_metrics,
@@ -1447,6 +1471,9 @@ def write_outputs(
         "dataset": report["dataset"],
         "confidence_threshold": report["confidence_threshold"],
         "class_names": report["class_names"],
+        "display_class_names": report.get(
+            "display_class_names", report["class_names"]
+        ),
         "images": [],
     }
     for pred, gt in zip(predictions, ground_truths):
@@ -1615,7 +1642,7 @@ def evaluate(
         # -------------------------------------------------------------------------
         # Stage 7: Load split (Req 9.1, 9.2, 9.3, 14.1, 14.3)
         # -------------------------------------------------------------------------
-        split_ds, class_names, idx_to_class, label_mapper = load_split(config)
+        split_ds, class_names, idx_to_class, display_class_names = load_split(config)
 
         # Extract evaluation parameters with defaults.
         _, split = _get_nested(config, ("evaluation", "split"))
@@ -1655,7 +1682,6 @@ def evaluate(
             device=device,
             input_size=int(input_size),
             idx_to_class=idx_to_class,
-            label_mapper=label_mapper,
         )
 
     except ConfigurationError:
@@ -1702,6 +1728,7 @@ def evaluate(
         metrics=metrics,
         confusion_matrix=confusion_matrix,
         errors=errors,
+        display_class_names=display_class_names,
     )
 
     # -------------------------------------------------------------------------
