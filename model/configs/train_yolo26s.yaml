@@ -35,13 +35,13 @@ training:
   seed: 42
   augmentation:
     horizontal_flip: true
+    vertical_flip: true
     brightness_range: [0.6, 1.4]
     hsv_h: 0.015
     hsv_s: 0.5
     hsv_v: 0.4
     scale: [0.5, 1.5]
 
-  
 evaluation:
   iou_thresholds: [0.5]
   confidence_threshold: 0.25
@@ -50,4 +50,3 @@ output:
   checkpoint_dir: ./checkpoints/yolo26
   results_dir: ./checkpoints/yolo26
   log_dir: ./logs/yolo26
- 

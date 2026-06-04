@@ -92,6 +92,11 @@ class RT_DETR_Detector(BaseDetector):
             model_file = self.MODEL_FILE_MAP[self.model_size]
             self._model = RTDETR(model_file)
 
+        # Reshape classification head if num_classes differs from pretrained nc.
+        # Must run BEFORE freeze logic (so freeze operates on final parameter graph)
+        # and BEFORE _build_loss_fn (so init_criterion reads the corrected nc).
+        self._reshape_head_if_needed()
+
         # Apply freeze layers logic (or default: all trainable)
         freeze_layers = config.get("freeze_layers", None)
 
@@ -231,69 +236,193 @@ class RT_DETR_Detector(BaseDetector):
                 frozen_names.add(name)
         return frozen_names
 
+    def _reshape_head_if_needed(self) -> None:
+        """Rebuild RT-DETR classification heads when num_classes differs from pretrained nc.
+
+        Pretrained RT-DETR weights (rtdetr-l.pt, rtdetr-x.pt) ship with ``nc=80``
+        (COCO). When the project's configured ``num_classes`` differs (e.g., 5 for
+        RDD2022), the decoder's classification heads must be replaced before
+        training, otherwise:
+            - The model emits 80-way logits instead of ``num_classes``-way.
+            - The criterion is built against the wrong ``nc``.
+            - Predicted label indices fall outside ``[0, num_classes - 1]``,
+              breaking the metrics pipeline silently.
+
+        Modules rebuilt (per Ultralytics RTDETRDecoder structure):
+            - ``decoder.dec_score_head`` : ModuleList of ``Linear(hidden_dim, nc)``
+              (one per decoder layer, default 6 layers).
+            - ``decoder.enc_score_head`` : ``Linear(hidden_dim, nc)`` for encoder
+              query selection.
+            - ``decoder.denoising_class_embed`` : ``Embedding(nc, hidden_dim)``
+              used by contrastive denoising training. Note this is ``nc``, not
+              ``nc + 1`` (verified against ultralytics source).
+
+        After rebuilding, ``decoder._reset_parameters()`` is invoked to set the
+        focal-loss bias prior on the new classification layers, which is critical
+        for stable early training.
+
+        No-op when ``num_classes == decoder.nc``.
+
+        Side effects:
+            - Sets ``decoder.nc = self.num_classes``.
+            - Sets ``model_module.nc = self.num_classes``.
+            - All newly created module parameters start with ``requires_grad=True``,
+              so subsequent freeze logic (which targets backbone-layer indices)
+              leaves them trainable.
+        """
+        if self._model is None or not hasattr(self._model, "model"):
+            return
+
+        model_module = self._model.model
+        if not hasattr(model_module, "model") or not hasattr(
+            model_module.model, "__getitem__"
+        ):
+            return
+
+        try:
+            decoder = model_module.model[-1]
+        except (IndexError, TypeError):
+            return
+
+        pretrained_nc = getattr(decoder, "nc", None)
+        if not isinstance(pretrained_nc, int):
+            return
+
+        if pretrained_nc == self.num_classes:
+            logger.debug(
+                "Classification head already matches num_classes=%d; skipping reshape",
+                self.num_classes,
+            )
+            return
+
+        hidden_dim = getattr(decoder, "hidden_dim", None)
+        if not isinstance(hidden_dim, int) or hidden_dim <= 0:
+            logger.warning(
+                "Cannot reshape RT-DETR head: decoder.hidden_dim missing or invalid"
+            )
+            return
+
+        n = self.num_classes
+
+        logger.info(
+            "Reshaping RT-DETR classification head: %d classes -> %d classes "
+            "(hidden_dim=%d)",
+            pretrained_nc,
+            n,
+            hidden_dim,
+        )
+
+        # Rebuild dec_score_head: ModuleList of Linear(hidden_dim, n), one per
+        # decoder layer. Preserve the original list length.
+        old_dec = decoder.dec_score_head
+        try:
+            num_dec_layers = len(old_dec)
+        except TypeError:
+            num_dec_layers = 6  # RT-DETR default
+        decoder.dec_score_head = torch.nn.ModuleList(
+            [torch.nn.Linear(hidden_dim, n) for _ in range(num_dec_layers)]
+        )
+
+        # Rebuild enc_score_head: single Linear(hidden_dim, n).
+        decoder.enc_score_head = torch.nn.Linear(hidden_dim, n)
+
+        # Rebuild denoising_class_embed if present: Embedding(n, hidden_dim).
+        # Per ultralytics source, this is sized exactly nc (not nc+1).
+        if hasattr(decoder, "denoising_class_embed"):
+            decoder.denoising_class_embed = torch.nn.Embedding(n, hidden_dim)
+
+        # Update nc on decoder and outer model module.
+        decoder.nc = n
+        model_module.nc = n
+
+        # Re-initialize all decoder parameters via Ultralytics' canonical method.
+        # This sets focal-loss bias priors on the new classification heads,
+        # which is essential for numerical stability in the first training steps.
+        if hasattr(decoder, "_reset_parameters"):
+            try:
+                decoder._reset_parameters()
+                logger.info("RT-DETR decoder parameters re-initialized after head reshape")
+            except Exception as exc:  # pragma: no cover - defensive
+                logger.warning(
+                    "decoder._reset_parameters() failed after head reshape: %s",
+                    exc,
+                )
+
     def _build_loss_fn(self) -> None:
         """Set up the loss computation from the Ultralytics model.
 
-        RT-DETR uses RTDETRDetectionLoss (Hungarian matching + set prediction loss),
-        which is different from YOLO's v8DetectionLoss. When loading from a .pt file,
-        Ultralytics creates a DetectionModel instead of RTDETRDetectionModel, so we
-        patch the model class to enable the correct loss computation path.
+        RT-DETR uses RTDETRDetectionLoss (Hungarian matching + set prediction loss).
+        When loading from a .pt file, Ultralytics may create a generic DetectionModel
+        instead of RTDETRDetectionModel, so we patch the model's class to enable the
+        correct loss path.
+
+        Critically, ``model_module.nc`` is set to ``self.num_classes`` BEFORE
+        ``init_criterion()`` is called, so the criterion is built against the
+        correct class count. This complements ``_reshape_head_if_needed()``,
+        which has already updated ``decoder.nc`` and rebuilt the classification
+        modules.
+
+        We do NOT pre-populate ``model_module.args`` with YOLO's ``box``/``cls``/``dfl``
+        loss-weight defaults: ``RTDETRDetectionLoss.__init__`` does not read those
+        keys (verified against ultralytics.models.utils.loss). It uses its own
+        ``loss_gain`` defaults: ``{"class": 1, "bbox": 5, "giou": 2, "no_object": 0.1}``.
+        Setting the YOLO keys is dead state that obscures intent.
+
+        Raises:
+            RuntimeError: If the constructed criterion's nc attribute does not
+                equal self.num_classes (defensive assertion).
         """
-        if self._model is not None and hasattr(self._model, "model"):
-            model_module = self._model.model
+        if self._model is None or not hasattr(self._model, "model"):
+            return
 
-            # Patch the model class to RTDETRDetectionModel if needed.
-            # When loading from .pt, Ultralytics creates a DetectionModel but
-            # RTDETRDetectionModel has the correct init_criterion() and loss() methods.
-            # Only attempt this when model_module has the expected Ultralytics structure.
+        model_module = self._model.model
+
+        # Patch the model class to RTDETRDetectionModel if needed so that the
+        # correct ``init_criterion()`` and ``loss()`` methods are used.
+        try:
+            from ultralytics.models.rtdetr.model import RTDETRDetectionModel
+
+            if (
+                not isinstance(model_module, RTDETRDetectionModel)
+                and hasattr(model_module, "model")
+                and hasattr(model_module.model, "__getitem__")
+            ):
+                model_module.__class__ = RTDETRDetectionModel
+        except (ImportError, AttributeError, IndexError, TypeError):
+            pass
+
+        # Force model_module.nc to the configured num_classes BEFORE init_criterion.
+        # This is the single most important line for correct loss adaptation.
+        model_module.nc = self.num_classes
+
+        # Initialize criterion via the model's init_criterion method.
+        # RTDETRDetectionLoss is built with nc=model_module.nc, so this picks up
+        # our corrected value.
+        if hasattr(model_module, "init_criterion"):
             try:
-                from ultralytics.models.rtdetr.model import RTDETRDetectionModel
-
-                if (
-                    not isinstance(model_module, RTDETRDetectionModel)
-                    and hasattr(model_module, "model")
-                    and hasattr(model_module.model, "__getitem__")
-                ):
-                    decoder = model_module.model[-1]
-                    if hasattr(decoder, "nc"):
-                        model_module.nc = decoder.nc
-                    else:
-                        model_module.nc = 80  # COCO default
-                    model_module.__class__ = RTDETRDetectionModel
-            except (ImportError, AttributeError, IndexError, TypeError):
-                pass
-
-            # Ensure model.args has loss hyperparameters and is a namespace
-            from types import SimpleNamespace
-
-            if hasattr(model_module, "args"):
-                args = model_module.args
-                if isinstance(args, dict):
-                    args.setdefault("box", 7.5)
-                    args.setdefault("cls", 0.5)
-                    args.setdefault("dfl", 1.5)
-                    model_module.args = SimpleNamespace(**args)
-                elif isinstance(args, SimpleNamespace):
-                    if not hasattr(args, "box"):
-                        args.box = 7.5
-                    if not hasattr(args, "cls"):
-                        args.cls = 0.5
-                    if not hasattr(args, "dfl"):
-                        args.dfl = 1.5
-            else:
-                model_module.args = SimpleNamespace(box=7.5, cls=0.5, dfl=1.5)
-
-            # Initialize criterion via the model's init_criterion method
-            if hasattr(model_module, "init_criterion"):
-                try:
-                    self._loss_fn = model_module.init_criterion()
-                    model_module.criterion = self._loss_fn
-                except Exception:
-                    self._loss_fn = None
-            elif hasattr(model_module, "criterion") and model_module.criterion is not None:
-                self._loss_fn = model_module.criterion
-            else:
+                self._loss_fn = model_module.init_criterion()
+                model_module.criterion = self._loss_fn
+            except Exception:
                 self._loss_fn = None
+        elif hasattr(model_module, "criterion") and model_module.criterion is not None:
+            self._loss_fn = model_module.criterion
+        else:
+            self._loss_fn = None
+
+        # Defensive assertion: criterion's nc must match self.num_classes.
+        # Hard failure here is preferable to silent training against wrong nc.
+        if self._loss_fn is not None and hasattr(self._loss_fn, "nc"):
+            criterion_nc = self._loss_fn.nc
+            # Only enforce when nc is a concrete int (skip Mocks in unit tests).
+            if isinstance(criterion_nc, int) and criterion_nc != self.num_classes:
+                raise RuntimeError(
+                    f"RT-DETR criterion nc mismatch: criterion was initialized "
+                    f"with nc={criterion_nc} but configuration requires "
+                    f"num_classes={self.num_classes}. This indicates the head "
+                    f"reshape or model.nc assignment did not take effect. "
+                    f"Aborting to prevent silent training against the wrong "
+                    f"output space."
+                )
 
     def _get_total_layer_count(self) -> int:
         """Return the total number of freezable sequential layers.
@@ -524,15 +653,24 @@ class RT_DETR_Detector(BaseDetector):
     def load_checkpoint(self, path: Path) -> None:
         """Load model weights from a checkpoint file.
 
-        Supports both Ultralytics native .pt files and framework-saved .pt files.
-        After loading, the model is ready for inference or continued training.
+        Supports both Ultralytics native ``.pt`` files and framework-saved ``.pt``
+        files. The state dict undergoes the following pre-processing before
+        ``load_state_dict``:
+
+        1. ``_orig_mod.`` key prefixes (added by ``torch.compile()``) are stripped.
+        2. Tensor shapes are validated against the current model's ``state_dict()``.
+           Any shape mismatch raises ``RuntimeError`` with a diagnostic listing
+           the first mismatching keys; we do NOT silently fall back to
+           ``strict=False`` partial loading, since that masks ``num_classes``
+           mismatches and other structural changes that should fail loud.
 
         Args:
             path: Path to the checkpoint file.
 
         Raises:
             FileNotFoundError: If the checkpoint file does not exist.
-            RuntimeError: If the checkpoint is corrupted or invalid format.
+            RuntimeError: On shape mismatch (with diagnostic), or if the file is
+                corrupted or otherwise unloadable.
         """
         checkpoint_path = Path(path)
         if not checkpoint_path.exists():
@@ -541,17 +679,69 @@ class RT_DETR_Detector(BaseDetector):
             )
 
         try:
-            state_dict = torch.load(str(checkpoint_path), map_location="cpu")
-            if isinstance(state_dict, dict) and "model_state_dict" in state_dict:
-                self._model.model.load_state_dict(state_dict["model_state_dict"])
-            else:
-                self._model.model.load_state_dict(state_dict)
+            raw = torch.load(str(checkpoint_path), map_location="cpu")
         except (FileNotFoundError, RuntimeError):
             raise
         except Exception as exc:
             raise RuntimeError(
                 f"Failed to load checkpoint '{checkpoint_path}': "
                 f"file is corrupted or not a valid checkpoint format"
+            ) from exc
+
+        # Extract state dict from common wrappers
+        if isinstance(raw, dict) and "model_state_dict" in raw:
+            state = raw["model_state_dict"]
+        elif isinstance(raw, dict) and "state_dict" in raw:
+            state = raw["state_dict"]
+        elif isinstance(raw, dict):
+            state = raw
+        else:
+            # Probably a full pickled model object; cannot validate shapes here.
+            try:
+                self._model.model.load_state_dict(raw)
+            except Exception as exc:
+                raise RuntimeError(
+                    f"Failed to load checkpoint '{checkpoint_path}': "
+                    f"unrecognized checkpoint format ({type(raw).__name__})"
+                ) from exc
+            return
+
+        # Strip torch.compile prefix from keys (does nothing if absent)
+        state = {
+            (k[len("_orig_mod."):] if k.startswith("_orig_mod.") else k): v
+            for k, v in state.items()
+        }
+
+        # Validate shapes against the current model's state dict.
+        # Hard fail on any mismatch, with a diagnostic message.
+        current = self._model.model.state_dict()
+        mismatches: List[tuple] = []
+        for k, v in state.items():
+            if k in current:
+                expected = tuple(current[k].shape)
+                actual = tuple(v.shape) if hasattr(v, "shape") else None
+                if actual is not None and actual != expected:
+                    mismatches.append((k, expected, actual))
+                    if len(mismatches) >= 5:
+                        break
+
+        if mismatches:
+            details = "; ".join(
+                f"{k}: expected {exp}, got {act}" for k, exp, act in mismatches
+            )
+            raise RuntimeError(
+                f"Checkpoint shape mismatch when loading '{checkpoint_path}'. "
+                f"This typically means num_classes (or another structural "
+                f"parameter) differs between the checkpoint and the current "
+                f"configuration. Mismatches (first {len(mismatches)}): {details}"
+            )
+
+        try:
+            self._model.model.load_state_dict(state)
+        except RuntimeError as exc:
+            raise RuntimeError(
+                f"Failed to load checkpoint '{checkpoint_path}' "
+                f"(load_state_dict raised after shape validation): {exc}"
             ) from exc
 
     def save_checkpoint(self, path: Path) -> None:

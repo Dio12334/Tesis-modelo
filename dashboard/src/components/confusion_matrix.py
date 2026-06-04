@@ -7,6 +7,7 @@ scale where higher values have more intense color.
 
 from typing import Optional
 
+import numpy as np
 import plotly.figure_factory as ff
 import streamlit as st
 
@@ -50,20 +51,45 @@ def render_confusion_matrix(report: Optional[EvaluationReport]) -> None:
         )
         return
 
+    # Display mode selector
+    display_mode = st.radio(
+        "Display mode",
+        options=["Nominal", "Percentage (row-wise)"],
+        horizontal=True,
+        help="Nominal shows absolute counts. Percentage shows row-wise normalization (% of each ground truth class).",
+    )
+
+    # Convert matrix to numpy array for easier manipulation
+    matrix_np = np.array(matrix, dtype=float)
+
+    if display_mode == "Percentage (row-wise)":
+        # Row-wise normalization: percentage of each ground truth class
+        row_sums = matrix_np.sum(axis=1, keepdims=True)
+        # Avoid division by zero
+        row_sums[row_sums == 0] = 1
+        matrix_percent = (matrix_np / row_sums) * 100
+        z_values = matrix_percent.tolist()
+        annotation_text = [[f"{val:.1f}%" for val in row] for row in matrix_percent]
+        title = "Confusion Matrix (Percentage)"
+    else:
+        z_values = matrix
+        annotation_text = [[str(cell) for cell in row] for row in matrix]
+        title = "Confusion Matrix"
+
     # Create annotated heatmap using Plotly figure_factory
     # Rows = ground truth, Columns = predicted
     fig = ff.create_annotated_heatmap(
-        z=matrix,
+        z=z_values,
         x=display_names,
         y=display_names,
-        annotation_text=[[str(cell) for cell in row] for row in matrix],
+        annotation_text=annotation_text,
         colorscale="Blues",
         showscale=True,
     )
 
     # Update layout for clarity
     fig.update_layout(
-        title="Confusion Matrix",
+        title=title,
         xaxis_title="Predicted Class",
         yaxis_title="Ground Truth Class",
         xaxis=dict(side="bottom"),
