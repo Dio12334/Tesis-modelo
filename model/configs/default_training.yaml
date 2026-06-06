@@ -10,9 +10,19 @@ training:
   val_split: 0.2
   checkpoint_dir: ./checkpoints
   log_interval: 10
+  loss:
+    label_smoothing: 0.0
+    focal_loss: false
+    focal_gamma: 0.0
+    focal_alpha: -1.0
   augmentation:
+    mosaic: 0.0
+    mixup: 0.0
+    mosaic_off_epochs: 0
     horizontal_flip: true
     vertical_flip: false
-    rotation_range: 15
-    brightness_range: [0.8, 1.2]
-    mosaic: true
+    hsv_h: 0.015
+    hsv_s: 0.7
+    hsv_v: 0.4
+    scale: [0.5, 1.5]
+    translate: 0.1
