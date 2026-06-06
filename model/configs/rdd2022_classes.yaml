@@ -18,21 +18,19 @@
 
 taxonomy:
   - bache
+  - block_crack
   - fisura_longitudinal
   - fisura_transversal
   - piel_de_cocodrilo
-  - otro
-
+  - repair
 mappings:
-  # Dataset Ninja format class names
   longitudinal crack: fisura_longitudinal
   transverse crack: fisura_transversal
   alligator crack: piel_de_cocodrilo
   pothole: bache
-  other corruption: otro
-  block crack: piel_de_cocodrilo
-  repair: otro
-  # Original RDD2022 code-based class names
+  block crack: block_crack          # CHANGED (was piel_de_cocodrilo)
+  repair: repair                    # CHANGED (was otro)
+  # other corruption: REMOVED (will be filtered out)
   D00: fisura_longitudinal
   D10: fisura_transversal
   D20: piel_de_cocodrilo
