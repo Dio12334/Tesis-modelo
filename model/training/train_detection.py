@@ -13,12 +13,14 @@ import argparse
 import inspect
 import logging
 import math
+import random
 import signal
 import sys
 import time
 from pathlib import Path
 from typing import List, Optional, Tuple
 
+import cv2
 import torch
 import torch.utils.data
 from torchvision import transforms as T
@@ -45,13 +47,35 @@ class RDD2022TorchDataset(torch.utils.data.Dataset):
 
     Converts the framework's Annotation objects into the format expected
     by torchvision detection models: (image_tensor, target_dict).
+
+    Supports multi-image augmentations (Mosaic, MixUp) at the dataset level
+    in addition to per-image transforms from augmentation.py.
     """
 
-    def __init__(self, dataset: RDD2022Dataset, input_size: int = 320, augmentation=None):
+    def __init__(
+        self,
+        dataset: RDD2022Dataset,
+        input_size: int = 320,
+        augmentation=None,
+        mosaic: float = 0.0,
+        mixup: float = 0.0,
+    ):
+        """Initialize the dataset adapter.
+
+        Args:
+            dataset: Underlying RDD2022Dataset instance.
+            input_size: Target image size (square).
+            augmentation: Per-image augmentation Compose pipeline or None.
+            mosaic: Probability of applying Mosaic augmentation (0=off, 1=always).
+            mixup: Probability of applying MixUp after Mosaic (0=off).
+        """
         self._annotations = dataset.get_annotations()
         self._input_size = input_size
         self._class_names = dataset.get_class_names()
         self._augmentation = augmentation  # augmentation.Compose pipeline or None
+        self._mosaic_p = mosaic
+        self._mixup_p = mixup
+        self._mosaic_enabled = mosaic > 0  # Can be toggled off for final epochs
         # Map class names to 0-indexed labels (YOLO models don't use a
         # background class; valid indices are 0..num_classes-1)
         self._class_to_idx = {
@@ -70,47 +94,168 @@ class RDD2022TorchDataset(torch.utils.data.Dataset):
     def num_classes(self) -> int:
         return len(self._class_names)
 
+    def set_mosaic_enabled(self, enabled: bool) -> None:
+        """Enable or disable Mosaic augmentation (for mosaic_off_epochs)."""
+        self._mosaic_enabled = enabled
+
     def __len__(self) -> int:
         return len(self._annotations)
 
-    def __getitem__(self, idx: int) -> Tuple[torch.Tensor, dict]:
-        annotation = self._annotations[idx]
+    def _load_image_and_bboxes(self, idx: int) -> Tuple[np.ndarray, List[List]]:
+        """Load a single image and its bounding boxes as numpy + normalized coords.
 
-        # Load image
+        Args:
+            idx: Index into annotations list.
+
+        Returns:
+            Tuple of (image_np [H,W,3 uint8], bboxes [[x1,y1,x2,y2,class_label], ...]).
+        """
+        annotation = self._annotations[idx]
         try:
             image = Image.open(annotation.image_path).convert("RGB")
         except (FileNotFoundError, OSError) as e:
-            # Return a blank image with no targets if file can't be loaded
             logger.warning("Could not load image %s: %s", annotation.image_path, e)
             image = Image.new("RGB", (self._input_size, self._input_size))
-            target = {
-                "boxes": torch.zeros((0, 4), dtype=torch.float32),
-                "labels": torch.zeros((0,), dtype=torch.int64),
-            }
-            return self._transform(image), target
+            return np.array(image), []
 
-        orig_w, orig_h = image.size
+        image_np = np.array(image)
+        bboxes = []
+        for bbox in annotation.bounding_boxes:
+            bboxes.append([bbox.x_min, bbox.y_min, bbox.x_max, bbox.y_max, bbox.class_label])
+        return image_np, bboxes
 
-        # Apply augmentation if configured (operates on numpy array + normalized bboxes)
-        if self._augmentation is not None:
-            # Convert PIL to numpy for augmentation
-            image_np = np.array(image)
-            # Build normalized bbox list: [x_min, y_min, x_max, y_max, class_label]
-            aug_bboxes = []
-            for bbox in annotation.bounding_boxes:
-                aug_bboxes.append([bbox.x_min, bbox.y_min, bbox.x_max, bbox.y_max, bbox.class_label])
+    def _build_mosaic(self, idx: int) -> Tuple[np.ndarray, List[List]]:
+        """Build a 4-image mosaic centered at a random point.
 
-            # Apply augmentation pipeline
-            image_np, aug_bboxes = self._augmentation(image_np, aug_bboxes)
+        Samples 3 additional random images and places all 4 into a 2x2 grid
+        with a random center point in [0.25*size, 0.75*size] for both axes
+        (Ultralytics default).
 
-            # Convert back to PIL for torchvision transforms
+        Args:
+            idx: Primary image index.
+
+        Returns:
+            Tuple of (mosaic_image [input_size, input_size, 3], merged_bboxes).
+        """
+        s = self._input_size
+        # Random mosaic center
+        cx = int(random.uniform(0.25 * s, 0.75 * s))
+        cy = int(random.uniform(0.25 * s, 0.75 * s))
+
+        # Sample 3 additional indices
+        n = len(self._annotations)
+        indices = [idx] + [random.randint(0, n - 1) for _ in range(3)]
+
+        # Canvas (gray fill like Ultralytics)
+        mosaic_img = np.full((s, s, 3), 114, dtype=np.uint8)
+        merged_bboxes: List[List] = []
+
+        for i, img_idx in enumerate(indices):
+            img_np, bboxes = self._load_image_and_bboxes(img_idx)
+            h_orig, w_orig = img_np.shape[:2]
+
+            # Determine placement region for each quadrant
+            if i == 0:  # top-left
+                # Image region that maps to canvas [0:cy, 0:cx]
+                x1c, y1c, x2c, y2c = 0, 0, cx, cy
+            elif i == 1:  # top-right
+                x1c, y1c, x2c, y2c = cx, 0, s, cy
+            elif i == 2:  # bottom-left
+                x1c, y1c, x2c, y2c = 0, cy, cx, s
+            else:  # bottom-right
+                x1c, y1c, x2c, y2c = cx, cy, s, s
+
+            # Target region dimensions on canvas
+            tw = x2c - x1c
+            th = y2c - y1c
+            if tw <= 0 or th <= 0:
+                continue
+
+            # Resize image to fit into its quadrant
+            resized = cv2.resize(img_np, (tw, th), interpolation=cv2.INTER_LINEAR)
+            mosaic_img[y1c:y2c, x1c:x2c] = resized
+
+            # Transform bboxes: map from normalized [0,1] of original image
+            # to normalized [0,1] of the mosaic canvas
+            for bbox in bboxes:
+                # Map bbox from original image space to canvas pixel space
+                bx1 = x1c + bbox[0] * tw
+                by1 = y1c + bbox[1] * th
+                bx2 = x1c + bbox[2] * tw
+                by2 = y1c + bbox[3] * th
+                # Normalize to mosaic canvas [0, 1]
+                nx1 = bx1 / s
+                ny1 = by1 / s
+                nx2 = bx2 / s
+                ny2 = by2 / s
+                merged_bboxes.append([nx1, ny1, nx2, ny2, bbox[4]])
+
+        # Clip and filter degenerate boxes
+        from model.training.augmentation import _clip_and_filter_bboxes
+        merged_bboxes = _clip_and_filter_bboxes(merged_bboxes)
+
+        return mosaic_img, merged_bboxes
+
+    def _apply_mixup(self, img1: np.ndarray, bboxes1: List[List]) -> Tuple[np.ndarray, List[List]]:
+        """Apply MixUp by blending with a random second image.
+
+        Uses beta distribution (alpha=1.5, beta=1.5) for blend ratio,
+        yielding a ratio typically in [0.3, 0.7].
+
+        Args:
+            img1: Primary image (numpy array, same size as input_size).
+            bboxes1: Bounding boxes for primary image.
+
+        Returns:
+            Tuple of (blended_image, merged_bboxes).
+        """
+        # Pick a random second image
+        idx2 = random.randint(0, len(self._annotations) - 1)
+
+        # If mosaic is enabled, second image is also a mosaic
+        if self._mosaic_enabled and self._mosaic_p > 0:
+            img2, bboxes2 = self._build_mosaic(idx2)
+        else:
+            img2, bboxes2 = self._load_image_and_bboxes(idx2)
+            # Resize img2 to input_size
+            img2 = cv2.resize(img2, (self._input_size, self._input_size), interpolation=cv2.INTER_LINEAR)
+            # bboxes2 are already normalized
+
+        # Blend ratio from beta distribution
+        ratio = np.random.beta(1.5, 1.5)
+        ratio = max(0.3, min(0.7, ratio))  # Clamp to avoid near-identity
+
+        # Blend images
+        blended = (img1.astype(np.float32) * ratio + img2.astype(np.float32) * (1.0 - ratio))
+        blended = np.clip(blended, 0, 255).astype(np.uint8)
+
+        # Merge bboxes from both images (both are already normalized)
+        merged = list(bboxes1) + list(bboxes2)
+        return blended, merged
+
+    def __getitem__(self, idx: int) -> Tuple[torch.Tensor, dict]:
+        # --- Multi-image augmentations (Mosaic + MixUp) ---
+        use_mosaic = self._mosaic_enabled and random.random() < self._mosaic_p
+        use_mixup = use_mosaic and random.random() < self._mixup_p
+
+        if use_mosaic:
+            image_np, bboxes = self._build_mosaic(idx)
+
+            if use_mixup:
+                image_np, bboxes = self._apply_mixup(image_np, bboxes)
+
+            # Apply per-image augmentation pipeline after mosaic/mixup
+            if self._augmentation is not None:
+                image_np, bboxes = self._augmentation(image_np, bboxes)
+
+            # Convert to tensor (image is already input_size x input_size)
             image = Image.fromarray(image_np)
+            image_tensor = T.Compose([T.ToTensor()])(image)
 
-            # Convert augmented bboxes to pixel coords at input_size
-            image_tensor = self._transform(image)
+            # Convert bboxes to pixel coords at input_size
             boxes = []
             labels = []
-            for bbox in aug_bboxes:
+            for bbox in bboxes:
                 x1 = bbox[0] * self._input_size
                 y1 = bbox[1] * self._input_size
                 x2 = bbox[2] * self._input_size
@@ -120,21 +265,58 @@ class RDD2022TorchDataset(torch.utils.data.Dataset):
                     class_idx = self._class_to_idx.get(bbox[4], 0)
                     labels.append(class_idx)
         else:
-            # No augmentation — original path
-            image_tensor = self._transform(image)
+            # --- Single-image path (original or with per-image augmentation) ---
+            annotation = self._annotations[idx]
 
-            # Convert normalized bounding boxes to pixel coordinates at the resized scale
-            boxes = []
-            labels = []
-            for bbox in annotation.bounding_boxes:
-                x1 = bbox.x_min * self._input_size
-                y1 = bbox.y_min * self._input_size
-                x2 = bbox.x_max * self._input_size
-                y2 = bbox.y_max * self._input_size
-                if x2 > x1 and y2 > y1:
-                    boxes.append([x1, y1, x2, y2])
-                    class_idx = self._class_to_idx.get(bbox.class_label, 0)
-                    labels.append(class_idx)
+            # Load image
+            try:
+                image = Image.open(annotation.image_path).convert("RGB")
+            except (FileNotFoundError, OSError) as e:
+                logger.warning("Could not load image %s: %s", annotation.image_path, e)
+                image = Image.new("RGB", (self._input_size, self._input_size))
+                target = {
+                    "boxes": torch.zeros((0, 4), dtype=torch.float32),
+                    "labels": torch.zeros((0,), dtype=torch.int64),
+                }
+                return self._transform(image), target
+
+            orig_w, orig_h = image.size
+
+            # Apply augmentation if configured (operates on numpy array + normalized bboxes)
+            if self._augmentation is not None:
+                image_np = np.array(image)
+                aug_bboxes = []
+                for bbox in annotation.bounding_boxes:
+                    aug_bboxes.append([bbox.x_min, bbox.y_min, bbox.x_max, bbox.y_max, bbox.class_label])
+
+                image_np, aug_bboxes = self._augmentation(image_np, aug_bboxes)
+
+                image = Image.fromarray(image_np)
+                image_tensor = self._transform(image)
+                boxes = []
+                labels = []
+                for bbox in aug_bboxes:
+                    x1 = bbox[0] * self._input_size
+                    y1 = bbox[1] * self._input_size
+                    x2 = bbox[2] * self._input_size
+                    y2 = bbox[3] * self._input_size
+                    if x2 > x1 and y2 > y1:
+                        boxes.append([x1, y1, x2, y2])
+                        class_idx = self._class_to_idx.get(bbox[4], 0)
+                        labels.append(class_idx)
+            else:
+                image_tensor = self._transform(image)
+                boxes = []
+                labels = []
+                for bbox in annotation.bounding_boxes:
+                    x1 = bbox.x_min * self._input_size
+                    y1 = bbox.y_min * self._input_size
+                    x2 = bbox.x_max * self._input_size
+                    y2 = bbox.y_max * self._input_size
+                    if x2 > x1 and y2 > y1:
+                        boxes.append([x1, y1, x2, y2])
+                        class_idx = self._class_to_idx.get(bbox.class_label, 0)
+                        labels.append(class_idx)
 
         if boxes:
             target = {
@@ -287,8 +469,17 @@ def train(config_path: str, verbose: bool = False) -> dict:
     augmentation_pipeline = build_augmentation_pipeline(aug_config) if aug_config else None
     logger.info("Augmentation pipeline: %s", augmentation_pipeline)
 
+    # Multi-image augmentation params (handled at dataset level)
+    mosaic_p = float(aug_config.get("mosaic", 0.0))
+    mixup_p = float(aug_config.get("mixup", 0.0))
+    mosaic_off_epochs = int(aug_config.get("mosaic_off_epochs", 0))
+    logger.info("Mosaic p=%.2f, MixUp p=%.2f, mosaic_off_epochs=%d", mosaic_p, mixup_p, mosaic_off_epochs)
+
     # Create PyTorch datasets
-    train_torch = RDD2022TorchDataset(train_ds, input_size=input_size, augmentation=augmentation_pipeline)
+    train_torch = RDD2022TorchDataset(
+        train_ds, input_size=input_size, augmentation=augmentation_pipeline,
+        mosaic=mosaic_p, mixup=mixup_p,
+    )
     val_torch = RDD2022TorchDataset(val_ds, input_size=input_size)  # No augmentation for validation
 
     # Create data loaders
@@ -422,6 +613,15 @@ def train(config_path: str, verbose: bool = False) -> dict:
     try:
         for epoch in range(epochs):
             epoch_start = time.time()
+
+            # --- Mosaic off for final N epochs (fine-tune on clean images) ---
+            if mosaic_off_epochs > 0 and epoch >= (epochs - mosaic_off_epochs):
+                if train_torch._mosaic_enabled:
+                    train_torch.set_mosaic_enabled(False)
+                    logger.info(
+                        "Epoch %d: Disabling Mosaic for final %d epochs",
+                        epoch + 1, mosaic_off_epochs,
+                    )
 
             # --- Linear warmup: LR = learning_rate * (epoch + 1) / warmup_epochs ---
             if epoch < warmup_epochs:
