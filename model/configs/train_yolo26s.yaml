@@ -10,7 +10,7 @@ model:
     confidence_threshold: 0.25
     iou_threshold: 0.5
     pretrained_weights: "yolo26s.pt"
-    freeze_layers: 14
+    freeze_layers: 5
 
 dataset:
   type: rdd2022
@@ -33,14 +33,22 @@ training:
   checkpoint_dir: ./checkpoints/yolo26
   log_interval: 10
   seed: 42
+  loss:
+    label_smoothing: 0.01
+    focal_loss: true
+    focal_gamma: 1.5
+    focal_alpha: 0.25
   augmentation:
+    mosaic: 1.0
+    mixup: 0.1
+    mosaic_off_epochs: 10
     horizontal_flip: true
-    vertical_flip: true
-    brightness_range: [0.6, 1.4]
+    vertical_flip: false
     hsv_h: 0.015
-    hsv_s: 0.5
+    hsv_s: 0.7
     hsv_v: 0.4
     scale: [0.5, 1.5]
+    translate: 0.1
 
 evaluation:
   iou_thresholds: [0.5]
