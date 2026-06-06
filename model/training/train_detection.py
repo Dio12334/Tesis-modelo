@@ -20,6 +20,7 @@ import time
 from pathlib import Path
 from typing import List, Optional, Tuple
 
+
 import cv2
 import torch
 import torch.utils.data
@@ -487,7 +488,20 @@ def train(config_path: str, verbose: bool = False) -> dict:
         model.to(device)
     logger.info("Model moved to %s", device)
 
-    # --- Build data pipeline ---
+    # Compile model for faster CUDA execution (torch.compile, requires PyTorch 2.0+)
+    if hasattr(torch, "compile") and device.type == "cuda":
+        try:
+            if hasattr(model, "_model") and hasattr(model._model, "model"):
+                model._model.model = torch.compile(model._model.model, mode="reduce-overhead")
+            elif hasattr(model, "_model"):
+                model._model = torch.compile(model._model, mode="reduce-overhead")
+            elif hasattr(model, "model"):
+                model.model = torch.compile(model.model, mode="reduce-overhead")
+            logger.info("Model compiled with torch.compile (mode=reduce-overhead)")
+        except Exception as e:
+            logger.warning("torch.compile failed, continuing without compilation: %s", e)
+
+
     logger.info("Loading dataset from %s", dataset_path)
     rdd_dataset = RDD2022Dataset(country_filter=country_filter)
     rdd_dataset.load(Path(dataset_path))
@@ -516,25 +530,30 @@ def train(config_path: str, verbose: bool = False) -> dict:
     )
     val_torch = RDD2022TorchDataset(val_ds, input_size=input_size)  # No augmentation for validation
 
+    # On Windows, DataLoader workers require explicit spawn context
+    is_windows = platform.system() == "Windows"
+    effective_workers = num_workers
+    mp_context = "spawn" if is_windows and effective_workers > 0 else None
+
     # Create data loaders
     train_loader = torch.utils.data.DataLoader(
         train_torch,
         batch_size=batch_size,
         shuffle=True,
-        num_workers=num_workers,
+        num_workers=effective_workers,
         pin_memory=True,
-        persistent_workers=num_workers > 0,
-        prefetch_factor=1 if num_workers > 0 else None,
+        persistent_workers=effective_workers > 0,
+        multiprocessing_context=mp_context,
         collate_fn=collate_fn,
     )
     val_loader = torch.utils.data.DataLoader(
         val_torch,
         batch_size=batch_size,
         shuffle=False,
-        num_workers=num_workers,
+        num_workers=effective_workers,
         pin_memory=True,
-        persistent_workers=num_workers > 0,
-        prefetch_factor=1 if num_workers > 0 else None,
+        persistent_workers=effective_workers > 0,
+        multiprocessing_context=mp_context,
         collate_fn=collate_fn,
     )
 
