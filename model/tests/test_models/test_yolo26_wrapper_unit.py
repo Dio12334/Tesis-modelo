@@ -520,28 +520,35 @@ class TestYOLO26TrainingMethods:
         mock_ul.YOLO.assert_called_once_with(str(weights_path))
 
     def test_build_loss_fn_with_criterion(self):
-        """Test that _build_loss_fn stores criterion when available.
+        """Test that _build_loss_fn stores criterion from init_criterion().
 
         Validates: Requirements 5.5
         """
         mock_ul = MagicMock()
         mock_yolo_instance = MagicMock()
         mock_criterion = MagicMock()
-        mock_yolo_instance.model.criterion = mock_criterion
+        # init_criterion() returns our mock criterion
+        mock_yolo_instance.model.init_criterion = MagicMock(return_value=mock_criterion)
+        # Ensure the mock doesn't look like E2E (no one2many attribute)
+        mock_criterion.one2many = None
+        del mock_criterion.one2many
         mock_ul.YOLO.return_value = mock_yolo_instance
 
         with patch("model.models.yolo26_wrapper.ultralytics", new=mock_ul):
             detector = YOLO26Detector({"model_size": "n", "num_classes": 5})
 
+        # Stock path: init_criterion() was called and its return used
         assert detector._loss_fn is mock_criterion
 
     def test_build_loss_fn_without_criterion(self):
-        """Test that _build_loss_fn sets None when no criterion available.
+        """Test that _build_loss_fn sets None when init_criterion fails.
 
         Validates: Requirements 5.5
         """
         mock_ul = MagicMock()
         mock_yolo_instance = MagicMock()
+        # init_criterion raises to simulate no criterion available
+        mock_yolo_instance.model.init_criterion = MagicMock(side_effect=AttributeError("no criterion"))
         mock_yolo_instance.model.criterion = None
         mock_ul.YOLO.return_value = mock_yolo_instance
 

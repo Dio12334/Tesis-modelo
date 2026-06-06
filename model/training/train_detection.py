@@ -416,6 +416,10 @@ def train(config_path: str, verbose: bool = False) -> dict:
     # --- Instantiate model via ModelRegistry (no model-type branching) ---
     model_cfg = dict(model_config)
     model_cfg["num_classes"] = num_classes
+    # Pass loss configuration to the model (label smoothing, focal loss)
+    loss_config = training_config.get("loss", {})
+    if loss_config:
+        model_cfg["loss"] = loss_config
     logger.info("Building model '%s' (num_classes=%d)", model_type, num_classes)
 
     try:

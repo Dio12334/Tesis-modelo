@@ -353,6 +353,10 @@ class YOLO26Detector(BaseDetector):
         The Ultralytics YOLO model requires init_criterion() to be called
         to set up the loss function. The criterion also needs the model's
         hyperparameters (args) to include loss weights (box, cls, dfl).
+
+        If the config contains a ``loss`` dict with ``label_smoothing`` or
+        ``focal_gamma`` > 0, uses EnhancedDetectionLoss (subclass of
+        v8DetectionLoss) which adds label smoothing and focal loss support.
         """
         if self._model is not None and hasattr(self._model, "model"):
             model_module = self._model.model
@@ -376,17 +380,69 @@ class YOLO26Detector(BaseDetector):
             else:
                 model_module.args = SimpleNamespace(box=7.5, cls=0.5, dfl=1.5)
 
-            # Initialize criterion via the model's init_criterion method
-            if hasattr(model_module, "init_criterion"):
+            # Inject enhanced loss parameters from config into model.args
+            loss_config = self.config.get("loss", {})
+            label_smoothing = float(loss_config.get("label_smoothing", 0.0))
+            focal_gamma = float(loss_config.get("focal_gamma", 0.0))
+            focal_alpha = float(loss_config.get("focal_alpha", -1.0))
+            # Enable focal_gamma from focal_loss: true shorthand
+            if loss_config.get("focal_loss", False) and focal_gamma == 0.0:
+                focal_gamma = 1.5  # default gamma when focal_loss: true
+
+            model_module.args.label_smoothing = label_smoothing
+            model_module.args.focal_gamma = focal_gamma
+            model_module.args.focal_alpha = focal_alpha
+
+            # Use EnhancedDetectionLoss if any enhanced feature is active;
+            # otherwise fall back to stock criterion for zero-overhead path.
+            use_enhanced = label_smoothing > 0 or focal_gamma > 0
+            if use_enhanced:
                 try:
-                    self._loss_fn = model_module.init_criterion()
+                    from model.training.loss import (
+                        EnhancedDetectionLoss,
+                        EnhancedE2EDetectLoss,
+                    )
+                    # Detect if model uses E2E loss (one2many + one2one branches)
+                    stock_criterion = None
+                    if hasattr(model_module, "init_criterion"):
+                        try:
+                            stock_criterion = model_module.init_criterion()
+                        except Exception:
+                            pass
+                    is_e2e = (
+                        stock_criterion is not None
+                        and hasattr(stock_criterion, "one2many")
+                    )
+                    if is_e2e:
+                        self._loss_fn = EnhancedE2EDetectLoss(model_module)
+                    else:
+                        self._loss_fn = EnhancedDetectionLoss(model_module)
                     model_module.criterion = self._loss_fn
-                except Exception:
+                    logger.info(
+                        "Using %s (label_smoothing=%.3f, "
+                        "focal_gamma=%.2f, focal_alpha=%.2f)",
+                        type(self._loss_fn).__name__,
+                        label_smoothing, focal_gamma, focal_alpha,
+                    )
+                except Exception as e:
+                    logger.warning(
+                        "Failed to build EnhancedDetectionLoss: %s. "
+                        "Falling back to stock criterion.", e
+                    )
+                    use_enhanced = False
+
+            if not use_enhanced:
+                # Stock criterion path (backward compatible)
+                if hasattr(model_module, "init_criterion"):
+                    try:
+                        self._loss_fn = model_module.init_criterion()
+                        model_module.criterion = self._loss_fn
+                    except Exception:
+                        self._loss_fn = None
+                elif hasattr(model_module, "criterion") and model_module.criterion is not None:
+                    self._loss_fn = model_module.criterion
+                else:
                     self._loss_fn = None
-            elif hasattr(model_module, "criterion") and model_module.criterion is not None:
-                self._loss_fn = model_module.criterion
-            else:
-                self._loss_fn = None
 
     # ------------------------------------------------------------------
     # Backbone / head layer identification helpers
