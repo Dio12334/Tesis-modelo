@@ -124,6 +124,19 @@ def load_experiment_run(filepath: Path) -> ExperimentRun:
             best_epoch=final["best_epoch"],
             total_epochs=total_epochs,
         )
+    elif metrics_history:
+        # Fallback: compute final_results from metrics_history when the
+        # training process was interrupted before calling end_run().
+        last = metrics_history[-1]
+        best_entry = min(metrics_history, key=lambda e: e.val_loss)
+        best_idx = metrics_history.index(best_entry)
+        final_results = FinalResults(
+            final_train_loss=last.train_loss,
+            final_val_loss=last.val_loss,
+            best_val_loss=best_entry.val_loss,
+            best_epoch=best_idx + 1,  # 1-indexed
+            total_epochs=len(metrics_history),
+        )
 
     return ExperimentRun(
         run_id=data["run_id"],

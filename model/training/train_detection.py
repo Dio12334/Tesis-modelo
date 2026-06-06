@@ -595,6 +595,23 @@ def train(config_path: str, verbose: bool = False) -> dict:
         # Second SIGINT caused immediate termination
         logger.warning("Training forcefully interrupted (double SIGINT)")
 
+    finally:
+        # --- End experiment tracking (always, even on interrupt/crash) ---
+        # This ensures final_results is populated in the run JSON so the
+        # dashboard never shows N/A for completed epochs.
+        final_metrics = {
+            "final_train_loss": avg_train_loss,
+            "final_val_loss": avg_val_loss,
+            "best_val_loss": best_val_loss,
+            "best_epoch": best_epoch,
+            "total_epochs": completed_epochs,
+            "run_id": run_id,
+        }
+        try:
+            tracker.end_run(run_id, final_metrics)
+        except Exception as e:
+            logger.warning("Failed to end experiment run: %s", e)
+
     # --- Final checkpoint ---
     final_metrics_dict = {
         "train_loss": avg_train_loss,
@@ -612,20 +629,6 @@ def train(config_path: str, verbose: bool = False) -> dict:
         logger.error("Failed to save final checkpoint: %s", e)
         signal.signal(signal.SIGINT, original_sigint_handler)
         sys.exit(1)
-
-    # --- End experiment tracking ---
-    final_metrics = {
-        "final_train_loss": avg_train_loss,
-        "final_val_loss": avg_val_loss,
-        "best_val_loss": best_val_loss,
-        "best_epoch": best_epoch,
-        "total_epochs": completed_epochs,
-        "run_id": run_id,
-    }
-    try:
-        tracker.end_run(run_id, final_metrics)
-    except Exception as e:
-        logger.warning("Failed to end experiment run: %s", e)
 
     # --- Restore original SIGINT handler ---
     signal.signal(signal.SIGINT, original_sigint_handler)

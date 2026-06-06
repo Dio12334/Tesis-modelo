@@ -34,30 +34,44 @@ def _get_run_label(run: ExperimentRun) -> str:
 
 
 def _get_map_for_run(
-    run: ExperimentRun, evaluation_report: Optional[EvaluationReport]
+    run: ExperimentRun, evaluation_report: Optional[EvaluationReport],
+    evaluation_reports: Optional[dict] = None,
 ) -> Optional[float]:
-    """Get mAP@0.5 for a run if evaluation report is available.
+    """Get mAP@0.5 for a run from its per-run evaluation report.
 
-    Currently the dashboard has a single global evaluation report.
-    Returns the mAP value if the report exists, otherwise None.
+    Looks up the run-specific evaluation report first. Falls back to the
+    global evaluation report if no per-run report is available.
+    Returns the mAP value if a report exists, otherwise None.
     """
-    if evaluation_report is None:
+    report = None
+    if evaluation_reports:
+        report = evaluation_reports.get(run.run_id)
+    if report is None:
+        report = evaluation_report
+    if report is None:
         return None
-    return evaluation_report.metrics.get("mAP@0.5")
+    return report.metrics.get("mAP@0.5")
 
 
 def _get_f1_for_run(
-    run: ExperimentRun, evaluation_report: Optional[EvaluationReport]
+    run: ExperimentRun, evaluation_report: Optional[EvaluationReport],
+    evaluation_reports: Optional[dict] = None,
 ) -> Optional[float]:
-    """Get F1-score for a run if evaluation report is available."""
-    if evaluation_report is None:
+    """Get F1-score for a run from its per-run evaluation report."""
+    report = None
+    if evaluation_reports:
+        report = evaluation_reports.get(run.run_id)
+    if report is None:
+        report = evaluation_report
+    if report is None:
         return None
-    return evaluation_report.metrics.get("f1_score")
+    return report.metrics.get("f1_score")
 
 
 def _build_comparison_dataframe(
     selected_runs: list[ExperimentRun],
     evaluation_report: Optional[EvaluationReport],
+    evaluation_reports: Optional[dict] = None,
 ) -> pd.DataFrame:
     """Build a comparison DataFrame with key metrics for each run.
 
@@ -92,10 +106,10 @@ def _build_comparison_dataframe(
             ),
         }
 
-        map_val = _get_map_for_run(run, evaluation_report)
+        map_val = _get_map_for_run(run, evaluation_report, evaluation_reports)
         row["mAP@0.5"] = f"{map_val:.2f}" if map_val is not None else "N/A"
 
-        f1_val = _get_f1_for_run(run, evaluation_report)
+        f1_val = _get_f1_for_run(run, evaluation_report, evaluation_reports)
         row["F1-Score"] = f"{f1_val:.2f}" if f1_val is not None else "N/A"
 
         rows.append(row)
@@ -106,19 +120,20 @@ def _build_comparison_dataframe(
 def _find_best_run_index(
     selected_runs: list[ExperimentRun],
     evaluation_report: Optional[EvaluationReport],
+    evaluation_reports: Optional[dict] = None,
 ) -> Optional[int]:
     """Find the index of the run with the best (highest) mAP@0.5.
 
     Returns None if no evaluation report is available.
     """
-    if evaluation_report is None:
+    if evaluation_report is None and not evaluation_reports:
         return None
 
     best_idx: Optional[int] = None
     best_map: float = -1.0
 
     for idx, run in enumerate(selected_runs):
-        map_val = _get_map_for_run(run, evaluation_report)
+        map_val = _get_map_for_run(run, evaluation_report, evaluation_reports)
         if map_val is not None and map_val > best_map:
             best_map = map_val
             best_idx = idx
@@ -129,10 +144,11 @@ def _find_best_run_index(
 def _render_comparison_table(
     selected_runs: list[ExperimentRun],
     evaluation_report: Optional[EvaluationReport],
+    evaluation_reports: Optional[dict] = None,
 ) -> None:
     """Render the comparison table with highlighting for the best run."""
-    df = _build_comparison_dataframe(selected_runs, evaluation_report)
-    best_idx = _find_best_run_index(selected_runs, evaluation_report)
+    df = _build_comparison_dataframe(selected_runs, evaluation_report, evaluation_reports)
+    best_idx = _find_best_run_index(selected_runs, evaluation_report, evaluation_reports)
 
     if best_idx is not None:
         # Highlight the best run row using pandas Styler
@@ -250,10 +266,14 @@ def render_run_comparison(
 
     # Comparison table
     st.subheader("Metrics Comparison")
-    _render_comparison_table(chosen_runs, data.evaluation_report)
+    _render_comparison_table(
+        chosen_runs, data.evaluation_report, data.evaluation_reports
+    )
 
-    if data.evaluation_report is not None:
-        best_idx = _find_best_run_index(chosen_runs, data.evaluation_report)
+    if data.evaluation_report is not None or data.evaluation_reports:
+        best_idx = _find_best_run_index(
+            chosen_runs, data.evaluation_report, data.evaluation_reports
+        )
         if best_idx is not None:
             best_label = _get_run_label(chosen_runs[best_idx])
             st.success(f"🏆 Best run (highest mAP@0.5): **{best_label}**")

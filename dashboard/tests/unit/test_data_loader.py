@@ -192,6 +192,23 @@ class TestLoadExperimentRun:
         filepath = _write_json(tmp_path, "run.json", data)
         run = load_experiment_run(filepath)
 
+        # When final_results is missing but metrics_history is non-empty,
+        # the loader computes final_results from history as a fallback.
+        assert run.final_results is not None
+        assert run.final_results.total_epochs == 2
+        assert run.final_results.final_train_loss == 7.480253080042397
+        assert run.final_results.final_val_loss == 9.241947364807128
+        assert run.final_results.best_val_loss == 9.241947364807128
+        assert run.final_results.best_epoch == 2  # 1-indexed
+
+    def test_handles_missing_final_results_and_empty_history(self, tmp_path: Path):
+        data = {**VALID_EXPERIMENT_RUN}
+        del data["final_results"]
+        data["metrics_history"] = []
+        filepath = _write_json(tmp_path, "run.json", data)
+        run = load_experiment_run(filepath)
+
+        # No history to compute from — final_results stays None.
         assert run.final_results is None
 
     def test_handles_total_epochs_trained_field_name(self, tmp_path: Path):

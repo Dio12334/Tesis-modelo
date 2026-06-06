@@ -797,7 +797,7 @@ def clamp_and_filter(
     for name, value in zip(coord_names, box):
         if value < 0.0:
             # Req 6.4: clamp below-range value, warning with image + original.
-            logger.warning(
+            logger.debug(
                 "Image %s: %s coordinate %s is below 0.0; clamping to 0.0",
                 image_id,
                 name,
@@ -806,7 +806,7 @@ def clamp_and_filter(
             clamped.append(0.0)
         elif value > 1.0:
             # Req 6.4: clamp above-range value, warning with image + original.
-            logger.warning(
+            logger.debug(
                 "Image %s: %s coordinate %s exceeds 1.0; clamping to 1.0",
                 image_id,
                 name,
