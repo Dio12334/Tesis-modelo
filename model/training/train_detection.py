@@ -104,21 +104,36 @@ class RDD2022TorchDataset(torch.utils.data.Dataset):
     def _load_image_and_bboxes(self, idx: int) -> Tuple[np.ndarray, List[List]]:
         """Load a single image and its bounding boxes as numpy + normalized coords.
 
+        The image is immediately resized to (input_size x input_size) to cap
+        per-image memory at ~1.2MB regardless of source resolution. Bounding
+        boxes remain in normalized [0,1] coordinates (unaffected by resize).
+
         Args:
             idx: Index into annotations list.
 
         Returns:
-            Tuple of (image_np [H,W,3 uint8], bboxes [[x1,y1,x2,y2,class_label], ...]).
+            Tuple of (image_np [input_size, input_size, 3 uint8],
+                      bboxes [[x1,y1,x2,y2,class_label], ...]).
         """
         annotation = self._annotations[idx]
         try:
             image = Image.open(annotation.image_path).convert("RGB")
+            image_np = np.array(image)
+            image.close()  # Release file descriptor and PIL buffer
         except (FileNotFoundError, OSError) as e:
             logger.warning("Could not load image %s: %s", annotation.image_path, e)
-            image = Image.new("RGB", (self._input_size, self._input_size))
-            return np.array(image), []
+            return np.zeros((self._input_size, self._input_size, 3), dtype=np.uint8), []
 
-        image_np = np.array(image)
+        # Early resize: cap memory at input_size×input_size×3 (~1.2MB for 640)
+        # regardless of source resolution (e.g. 3264×2448 = ~24MB).
+        # Bounding boxes are normalized so they are unaffected by resize.
+        h, w = image_np.shape[:2]
+        if h != self._input_size or w != self._input_size:
+            image_np = cv2.resize(
+                image_np, (self._input_size, self._input_size),
+                interpolation=cv2.INTER_LINEAR,
+            )
+
         bboxes = []
         for bbox in annotation.bounding_boxes:
             bboxes.append([bbox.x_min, bbox.y_min, bbox.x_max, bbox.y_max, bbox.class_label])
@@ -152,7 +167,6 @@ class RDD2022TorchDataset(torch.utils.data.Dataset):
 
         for i, img_idx in enumerate(indices):
             img_np, bboxes = self._load_image_and_bboxes(img_idx)
-            h_orig, w_orig = img_np.shape[:2]
 
             # Determine placement region for each quadrant
             if i == 0:  # top-left
@@ -169,11 +183,14 @@ class RDD2022TorchDataset(torch.utils.data.Dataset):
             tw = x2c - x1c
             th = y2c - y1c
             if tw <= 0 or th <= 0:
+                del img_np  # Free early
                 continue
 
             # Resize image to fit into its quadrant
-            resized = cv2.resize(img_np, (tw, th), interpolation=cv2.INTER_LINEAR)
-            mosaic_img[y1c:y2c, x1c:x2c] = resized
+            mosaic_img[y1c:y2c, x1c:x2c] = cv2.resize(
+                img_np, (tw, th), interpolation=cv2.INTER_LINEAR
+            )
+            del img_np  # Free source image immediately after placement
 
             # Transform bboxes: map from normalized [0,1] of original image
             # to normalized [0,1] of the mosaic canvas
@@ -225,9 +242,8 @@ class RDD2022TorchDataset(torch.utils.data.Dataset):
         ratio = np.random.beta(1.5, 1.5)
         ratio = max(0.3, min(0.7, ratio))  # Clamp to avoid near-identity
 
-        # Blend images
-        blended = (img1.astype(np.float32) * ratio + img2.astype(np.float32) * (1.0 - ratio))
-        blended = np.clip(blended, 0, 255).astype(np.uint8)
+        # Blend images using cv2.addWeighted (avoids allocating float32 copies)
+        blended = cv2.addWeighted(img1, ratio, img2, 1.0 - ratio, 0.0)
 
         # Merge bboxes from both images (both are already normalized)
         merged = list(bboxes1) + list(bboxes2)
@@ -248,9 +264,11 @@ class RDD2022TorchDataset(torch.utils.data.Dataset):
             if self._augmentation is not None:
                 image_np, bboxes = self._augmentation(image_np, bboxes)
 
-            # Convert to tensor (image is already input_size x input_size)
-            image = Image.fromarray(image_np)
-            image_tensor = T.Compose([T.ToTensor()])(image)
+            # Convert to tensor directly from numpy (avoids PIL intermediate allocation)
+            # image_np is already (input_size, input_size, 3) uint8
+            image_tensor = torch.from_numpy(
+                image_np.transpose(2, 0, 1).copy()  # HWC -> CHW
+            ).float().div_(255.0)
 
             # Convert bboxes to pixel coords at input_size
             boxes = []
@@ -273,26 +291,37 @@ class RDD2022TorchDataset(torch.utils.data.Dataset):
                 image = Image.open(annotation.image_path).convert("RGB")
             except (FileNotFoundError, OSError) as e:
                 logger.warning("Could not load image %s: %s", annotation.image_path, e)
-                image = Image.new("RGB", (self._input_size, self._input_size))
+                blank = Image.new("RGB", (self._input_size, self._input_size))
                 target = {
                     "boxes": torch.zeros((0, 4), dtype=torch.float32),
                     "labels": torch.zeros((0,), dtype=torch.int64),
                 }
-                return self._transform(image), target
+                tensor = self._transform(blank)
+                blank.close()
+                return tensor, target
 
             orig_w, orig_h = image.size
 
             # Apply augmentation if configured (operates on numpy array + normalized bboxes)
             if self._augmentation is not None:
                 image_np = np.array(image)
+                image.close()  # Release PIL buffer
                 aug_bboxes = []
                 for bbox in annotation.bounding_boxes:
                     aug_bboxes.append([bbox.x_min, bbox.y_min, bbox.x_max, bbox.y_max, bbox.class_label])
 
                 image_np, aug_bboxes = self._augmentation(image_np, aug_bboxes)
 
-                image = Image.fromarray(image_np)
-                image_tensor = self._transform(image)
+                # Resize to input_size and convert to tensor (avoid PIL intermediate)
+                h, w = image_np.shape[:2]
+                if h != self._input_size or w != self._input_size:
+                    image_np = cv2.resize(
+                        image_np, (self._input_size, self._input_size),
+                        interpolation=cv2.INTER_LINEAR,
+                    )
+                image_tensor = torch.from_numpy(
+                    image_np.transpose(2, 0, 1).copy()
+                ).float().div_(255.0)
                 boxes = []
                 labels = []
                 for bbox in aug_bboxes:
@@ -306,6 +335,7 @@ class RDD2022TorchDataset(torch.utils.data.Dataset):
                         labels.append(class_idx)
             else:
                 image_tensor = self._transform(image)
+                image.close()  # Release PIL buffer
                 boxes = []
                 labels = []
                 for bbox in annotation.bounding_boxes:
@@ -494,6 +524,7 @@ def train(config_path: str, verbose: bool = False) -> dict:
         num_workers=num_workers,
         pin_memory=True,
         persistent_workers=num_workers > 0,
+        prefetch_factor=1 if num_workers > 0 else None,
         collate_fn=collate_fn,
     )
     val_loader = torch.utils.data.DataLoader(
@@ -503,6 +534,7 @@ def train(config_path: str, verbose: bool = False) -> dict:
         num_workers=num_workers,
         pin_memory=True,
         persistent_workers=num_workers > 0,
+        prefetch_factor=1 if num_workers > 0 else None,
         collate_fn=collate_fn,
     )
 
