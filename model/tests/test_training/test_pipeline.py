@@ -22,7 +22,6 @@ from model.training.augmentation import (
     Compose,
     RandomBrightness,
     RandomHorizontalFlip,
-    RandomRotation,
     RandomVerticalFlip,
     build_augmentation_pipeline,
 )
@@ -413,7 +412,10 @@ class TestAugmentationPipelineComposition:
     """Verify augmentation pipeline builds correctly from config."""
 
     def test_full_augmentation_config(self):
-        """All augmentation options enabled produces correct pipeline."""
+        """All supported augmentation options enabled produces correct pipeline.
+
+        Legacy keys ``rotation_range`` and ``mosaic`` are accepted but ignored.
+        """
         config = {
             "augmentation": {
                 "horizontal_flip": True,
@@ -425,8 +427,8 @@ class TestAugmentationPipelineComposition:
         }
         pipeline = build_augmentation_pipeline(config)
         assert isinstance(pipeline, Compose)
-        # hflip + vflip + rotation + brightness + mosaic = 5
-        assert len(pipeline.transforms) == 5
+        # hflip + vflip + brightness = 3 (rotation/mosaic removed)
+        assert len(pipeline.transforms) == 3
 
     def test_partial_augmentation_config(self):
         """Only some augmentations enabled."""
@@ -442,16 +444,15 @@ class TestAugmentationPipelineComposition:
         assert len(pipeline.transforms) == 1
         assert isinstance(pipeline.transforms[0], RandomHorizontalFlip)
 
-    def test_augmentation_with_rotation_and_brightness(self):
-        """Rotation and brightness only."""
+    def test_augmentation_with_brightness_only(self):
+        """Brightness only (rotation_range is now ignored)."""
         config = {
             "rotation_range": 20,
             "brightness_range": [0.7, 1.3],
         }
         pipeline = build_augmentation_pipeline(config)
-        assert len(pipeline.transforms) == 2
-        assert isinstance(pipeline.transforms[0], RandomRotation)
-        assert isinstance(pipeline.transforms[1], RandomBrightness)
+        assert len(pipeline.transforms) == 1
+        assert isinstance(pipeline.transforms[0], RandomBrightness)
 
     def test_empty_augmentation_config(self):
         """Empty config produces empty pipeline."""

@@ -180,7 +180,7 @@ def _orchestration_patches(fake_detector=None, num_images=2):
         ),
         "load_split": patch(
             "model.training.evaluate_detection.load_split",
-            return_value=(fake_split, class_names, idx_to_class, None),
+            return_value=(fake_split, class_names, idx_to_class, list(class_names)),
         ),
         "run_inference": patch(
             "model.training.evaluate_detection.run_inference",

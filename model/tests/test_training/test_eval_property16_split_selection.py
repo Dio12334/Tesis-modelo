@@ -178,7 +178,7 @@ class TestProperty16SplitSelection:
         fake_cls, created = _make_fake_dataset_class()
 
         with patch("model.training.evaluate_detection.RDD2022Dataset", fake_cls):
-            split_dataset, class_names, idx_to_class, _label_mapper = load_split(config)
+            split_dataset, class_names, idx_to_class, _display_class_names = load_split(config)
 
         # Exactly one source dataset is constructed and loaded from dataset.path.
         assert len(created) == 1

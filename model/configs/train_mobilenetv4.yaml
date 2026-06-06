@@ -1,0 +1,37 @@
+name: rdd2022_mobilenetv4_ssd
+
+model:
+  type: mobilenetv4_ssd
+  config:
+    input_size: 640
+    num_classes: 5
+
+dataset:
+  type: rdd2022
+  path: model/data/rdd2022/complete
+  class_mapping: model/configs/rdd2022_classes.yaml
+
+training:
+  epochs: 100
+  early_stopping_patience: 15
+  batch_size: 32
+  num_workers: 8
+  use_amp: true
+  learning_rate: 0.005
+  optimizer: AdamW
+  weight_decay: 0.0005
+  momentum: 0.9
+  scheduler: cosine
+  warmup_epochs: 5
+  val_split: 0.2
+  checkpoint_dir: ./checkpoints/mobilenetv4_ssd
+  log_interval: 25
+
+evaluation:
+  iou_thresholds: [0.5]
+  confidence_threshold: 0.25
+
+output:
+  checkpoint_dir: ./checkpoints/mobilenetv4_ssd
+  results_dir: ./checkpoints/mobilenetv4_ssd
+  log_dir: ./logs/mobilenetv4_ssd

@@ -58,7 +58,8 @@ class TestEvaluationEngine:
         assert 0.0 <= report.recall <= 1.0
         assert 0.0 <= report.f1_score <= 1.0
         assert report.class_names == ["crack", "pothole"]
-        assert report.confusion_matrix.shape == (2, 2)
+        # (N+1)x(N+1): includes background row/col for FP/missed detections
+        assert report.confusion_matrix.shape == (3, 3)
         assert report.timestamp  # Non-empty timestamp
 
     def test_evaluate_perfect_predictions(self):
@@ -151,7 +152,8 @@ class TestEvaluationEngine:
         assert report.class_names == ["crack"]
         assert "crack" in report.per_class_ap
         assert "pothole" not in report.per_class_ap
-        assert report.confusion_matrix.shape == (1, 1)
+        # (N+1)x(N+1): includes background row/col for FP/missed detections
+        assert report.confusion_matrix.shape == (2, 2)
 
     def test_evaluate_class_filtering_excludes_unlisted(self):
         """Test that unlisted classes don't affect metrics."""

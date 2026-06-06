@@ -6,18 +6,51 @@ returning the transformed image and adjusted bounding boxes.
 
 Transforms are composable via the Compose class and can be built from a
 YAML-style augmentation config dict using build_augmentation_pipeline().
+
+Bounding boxes are in normalized [0, 1] format: [x_min, y_min, x_max, y_max, ...].
+Every spatial transform clips bboxes to [0, 1] and discards degenerate boxes
+(area < MIN_BBOX_AREA) after transformation.
 """
 
-import math
 import random
 from typing import List, Tuple
 
+import cv2
 import numpy as np
 
 
 # Type aliases for clarity
 Image = np.ndarray  # HxWxC uint8 numpy array
-BBoxes = List[List[float]]  # List of [x_min, y_min, x_max, y_max] normalized [0,1]
+BBoxes = List[List]  # List of [x_min, y_min, x_max, y_max, class_label, ...]
+
+# Minimum bbox area (normalized) to keep after augmentation; smaller boxes are
+# discarded as slivers produced by cropping/clipping.
+MIN_BBOX_AREA = 0.001
+
+
+def _clip_and_filter_bboxes(bboxes: BBoxes) -> BBoxes:
+    """Clip bbox coordinates to [0, 1] and discard degenerate boxes.
+
+    A box is degenerate if its area after clipping is below MIN_BBOX_AREA or
+    if x_max <= x_min or y_max <= y_min.
+
+    Args:
+        bboxes: List of bounding boxes in normalized [0, 1] format.
+
+    Returns:
+        Filtered list of valid bounding boxes.
+    """
+    result = []
+    for bbox in bboxes:
+        x_min = max(0.0, min(1.0, bbox[0]))
+        y_min = max(0.0, min(1.0, bbox[1]))
+        x_max = max(0.0, min(1.0, bbox[2]))
+        y_max = max(0.0, min(1.0, bbox[3]))
+        w = x_max - x_min
+        h = y_max - y_min
+        if w > 0 and h > 0 and w * h >= MIN_BBOX_AREA:
+            result.append([x_min, y_min, x_max, y_max] + bbox[4:])
+    return result
 
 
 class Compose:
@@ -57,8 +90,7 @@ class RandomHorizontalFlip:
                 x_min, y_min, x_max, y_max = bbox[:4]
                 new_x_min = 1.0 - x_max
                 new_x_max = 1.0 - x_min
-                new_bbox = [new_x_min, y_min, new_x_max, y_max] + bbox[4:]
-                new_bboxes.append(new_bbox)
+                new_bboxes.append([new_x_min, y_min, new_x_max, y_max] + bbox[4:])
             bboxes = new_bboxes
         return image, bboxes
 
@@ -70,6 +102,7 @@ class RandomVerticalFlip:
     """Randomly flips the image vertically with a given probability.
 
     Bounding box y-coordinates are mirrored accordingly.
+    Not recommended for road images (roads don't appear upside down).
     """
 
     def __init__(self, p: float = 0.5):
@@ -83,114 +116,12 @@ class RandomVerticalFlip:
                 x_min, y_min, x_max, y_max = bbox[:4]
                 new_y_min = 1.0 - y_max
                 new_y_max = 1.0 - y_min
-                new_bbox = [x_min, new_y_min, x_max, new_y_max] + bbox[4:]
-                new_bboxes.append(new_bbox)
+                new_bboxes.append([x_min, new_y_min, x_max, new_y_max] + bbox[4:])
             bboxes = new_bboxes
         return image, bboxes
 
     def __repr__(self) -> str:
         return f"RandomVerticalFlip(p={self.p})"
-
-
-class RandomRotation:
-    """Randomly rotates the image within a degree range.
-
-    Bounding boxes are rotated and then re-computed as axis-aligned
-    bounding rectangles enclosing the rotated corners. Boxes are clipped
-    to [0, 1] range after rotation.
-    """
-
-    def __init__(self, max_degrees: float = 15.0):
-        self.max_degrees = max_degrees
-
-    def __call__(self, image: Image, bboxes: BBoxes) -> Tuple[Image, BBoxes]:
-        angle = random.uniform(-self.max_degrees, self.max_degrees)
-        if abs(angle) < 1e-6:
-            return image, bboxes
-
-        h, w = image.shape[:2]
-        cx, cy = w / 2.0, h / 2.0
-
-        # Rotation matrix
-        rad = math.radians(angle)
-        cos_a = math.cos(rad)
-        sin_a = math.sin(rad)
-
-        # Rotate image using affine transform (manual implementation)
-        image = self._rotate_image(image, angle, cx, cy, cos_a, sin_a, w, h)
-
-        # Rotate bounding boxes
-        new_bboxes = []
-        for bbox in bboxes:
-            x_min, y_min, x_max, y_max = bbox[:4]
-            # Convert normalized coords to pixel coords
-            px_min, py_min = x_min * w, y_min * h
-            px_max, py_max = x_max * w, y_max * h
-
-            # Get four corners
-            corners = [
-                (px_min, py_min),
-                (px_max, py_min),
-                (px_max, py_max),
-                (px_min, py_max),
-            ]
-
-            # Rotate each corner around center
-            rotated_corners = []
-            for px, py in corners:
-                rx = cos_a * (px - cx) - sin_a * (py - cy) + cx
-                ry = sin_a * (px - cx) + cos_a * (py - cy) + cy
-                rotated_corners.append((rx, ry))
-
-            # Get axis-aligned bounding box of rotated corners
-            xs = [c[0] for c in rotated_corners]
-            ys = [c[1] for c in rotated_corners]
-            new_px_min = max(0.0, min(xs))
-            new_py_min = max(0.0, min(ys))
-            new_px_max = min(float(w), max(xs))
-            new_py_max = min(float(h), max(ys))
-
-            # Convert back to normalized coords
-            new_x_min = new_px_min / w
-            new_y_min = new_py_min / h
-            new_x_max = new_px_max / w
-            new_y_max = new_py_max / h
-
-            # Only keep valid boxes
-            if new_x_max > new_x_min and new_y_max > new_y_min:
-                new_bbox = [new_x_min, new_y_min, new_x_max, new_y_max] + bbox[4:]
-                new_bboxes.append(new_bbox)
-
-        bboxes = new_bboxes
-        return image, bboxes
-
-    def _rotate_image(
-        self,
-        image: Image,
-        angle: float,
-        cx: float,
-        cy: float,
-        cos_a: float,
-        sin_a: float,
-        w: int,
-        h: int,
-    ) -> Image:
-        """Rotate image around center using inverse mapping."""
-        rotated = np.zeros_like(image)
-        # Inverse rotation to map destination pixels to source
-        for y in range(h):
-            for x in range(w):
-                # Map destination (x, y) back to source
-                src_x = cos_a * (x - cx) + sin_a * (y - cy) + cx
-                src_y = -sin_a * (x - cx) + cos_a * (y - cy) + cy
-                src_xi = int(round(src_x))
-                src_yi = int(round(src_y))
-                if 0 <= src_xi < w and 0 <= src_yi < h:
-                    rotated[y, x] = image[src_yi, src_xi]
-        return rotated
-
-    def __repr__(self) -> str:
-        return f"RandomRotation(max_degrees={self.max_degrees})"
 
 
 class RandomBrightness:
@@ -205,7 +136,6 @@ class RandomBrightness:
 
     def __call__(self, image: Image, bboxes: BBoxes) -> Tuple[Image, BBoxes]:
         factor = random.uniform(self.low, self.high)
-        # Apply brightness factor and clip to valid range
         image = np.clip(image.astype(np.float32) * factor, 0, 255).astype(np.uint8)
         return image, bboxes
 
@@ -213,167 +143,187 @@ class RandomBrightness:
         return f"RandomBrightness(range=({self.low}, {self.high}))"
 
 
-class Mosaic:
-    """Mosaic augmentation placeholder.
+class RandomHSV:
+    """Randomly adjusts image HSV channels.
 
-    Mosaic augmentation combines 4 images into one by placing them in a 2x2 grid.
-    Since this requires access to multiple images from the dataset, this class
-    stores the configuration and provides a single-image fallback that applies
-    a random crop and resize to simulate partial mosaic behavior.
+    Applies random gains to Hue, Saturation, and Value channels independently.
+    Bounding boxes are not affected (color-only transform).
 
-    For full mosaic augmentation, the training pipeline should call
-    `apply_mosaic()` with 4 images before individual transforms.
+    Args:
+        h_gain: Maximum fractional hue shift (applied as ±h_gain * 180 degrees).
+        s_gain: Maximum fractional saturation multiplier (range: [1-s_gain, 1+s_gain]).
+        v_gain: Maximum fractional value multiplier (range: [1-v_gain, 1+v_gain]).
     """
 
-    def __init__(self, p: float = 0.5):
-        self.p = p
+    def __init__(self, h_gain: float = 0.015, s_gain: float = 0.7, v_gain: float = 0.4):
+        self.h_gain = h_gain
+        self.s_gain = s_gain
+        self.v_gain = v_gain
 
     def __call__(self, image: Image, bboxes: BBoxes) -> Tuple[Image, BBoxes]:
-        """Single-image fallback: random crop to simulate mosaic quadrant."""
-        if random.random() >= self.p:
-            return image, bboxes
+        # Random gains
+        h_delta = random.uniform(-self.h_gain, self.h_gain) * 180.0
+        s_mult = random.uniform(1.0 - self.s_gain, 1.0 + self.s_gain)
+        v_mult = random.uniform(1.0 - self.v_gain, 1.0 + self.v_gain)
 
-        h, w = image.shape[:2]
-        # Pick a random quadrant
-        cx = random.uniform(0.3, 0.7)
-        cy = random.uniform(0.3, 0.7)
+        # Convert RGB to HSV (cv2 expects BGR, so convert)
+        img_hsv = cv2.cvtColor(image, cv2.COLOR_RGB2HSV).astype(np.float32)
 
-        # Crop region in normalized coords
-        crop_x_min = cx - 0.5
-        crop_y_min = cy - 0.5
-        crop_x_max = cx + 0.5
-        crop_y_max = cy + 0.5
+        # Apply gains
+        img_hsv[:, :, 0] = (img_hsv[:, :, 0] + h_delta) % 180.0
+        img_hsv[:, :, 1] = np.clip(img_hsv[:, :, 1] * s_mult, 0, 255)
+        img_hsv[:, :, 2] = np.clip(img_hsv[:, :, 2] * v_mult, 0, 255)
 
-        # Clip to image bounds
-        crop_x_min = max(0.0, crop_x_min)
-        crop_y_min = max(0.0, crop_y_min)
-        crop_x_max = min(1.0, crop_x_max)
-        crop_y_max = min(1.0, crop_y_max)
-
-        # Convert to pixel coords for cropping
-        px_min = int(crop_x_min * w)
-        py_min = int(crop_y_min * h)
-        px_max = int(crop_x_max * w)
-        py_max = int(crop_y_max * h)
-
-        # Ensure valid crop dimensions
-        if px_max <= px_min or py_max <= py_min:
-            return image, bboxes
-
-        cropped = image[py_min:py_max, px_min:px_max].copy()
-
-        # Adjust bounding boxes to new crop region
-        crop_w = crop_x_max - crop_x_min
-        crop_h = crop_y_max - crop_y_min
-        new_bboxes = []
-        for bbox in bboxes:
-            x_min, y_min, x_max, y_max = bbox[:4]
-            # Shift and scale to crop region
-            new_x_min = (x_min - crop_x_min) / crop_w
-            new_y_min = (y_min - crop_y_min) / crop_h
-            new_x_max = (x_max - crop_x_min) / crop_w
-            new_y_max = (y_max - crop_y_min) / crop_h
-
-            # Clip to [0, 1]
-            new_x_min = max(0.0, new_x_min)
-            new_y_min = max(0.0, new_y_min)
-            new_x_max = min(1.0, new_x_max)
-            new_y_max = min(1.0, new_y_max)
-
-            # Keep only if box has valid area
-            if new_x_max > new_x_min and new_y_max > new_y_min:
-                new_bbox = [new_x_min, new_y_min, new_x_max, new_y_max] + bbox[4:]
-                new_bboxes.append(new_bbox)
-
-        return cropped, new_bboxes
-
-    @staticmethod
-    def apply_mosaic(
-        images: List[Image], bboxes_list: List[BBoxes], target_size: Tuple[int, int]
-    ) -> Tuple[Image, BBoxes]:
-        """Combine 4 images into a 2x2 mosaic grid.
-
-        Args:
-            images: List of exactly 4 images (numpy arrays).
-            bboxes_list: List of 4 bounding box lists corresponding to each image.
-            target_size: (height, width) of the output mosaic image.
-
-        Returns:
-            Tuple of (mosaic_image, combined_bboxes) with adjusted coordinates.
-        """
-        if len(images) != 4 or len(bboxes_list) != 4:
-            raise ValueError("Mosaic requires exactly 4 images and bbox lists")
-
-        th, tw = target_size
-        half_h, half_w = th // 2, tw // 2
-        mosaic = np.zeros((th, tw, 3), dtype=np.uint8)
-        combined_bboxes: BBoxes = []
-
-        # Quadrant positions: (y_offset, x_offset, height, width)
-        quadrants = [
-            (0, 0, half_h, half_w),           # top-left
-            (0, half_w, half_h, tw - half_w),  # top-right
-            (half_h, 0, th - half_h, half_w),  # bottom-left
-            (half_h, half_w, th - half_h, tw - half_w),  # bottom-right
-        ]
-
-        for i, (y_off, x_off, qh, qw) in enumerate(quadrants):
-            img = images[i]
-            ih, iw = img.shape[:2]
-
-            # Resize image to fit quadrant
-            resized = _resize_image(img, qh, qw)
-            mosaic[y_off : y_off + qh, x_off : x_off + qw] = resized
-
-            # Adjust bounding boxes for this quadrant
-            for bbox in bboxes_list[i]:
-                x_min, y_min, x_max, y_max = bbox[:4]
-                # Scale to quadrant position in mosaic
-                new_x_min = (x_min * qw + x_off) / tw
-                new_y_min = (y_min * qh + y_off) / th
-                new_x_max = (x_max * qw + x_off) / tw
-                new_y_max = (y_max * qh + y_off) / th
-                combined_bboxes.append(
-                    [new_x_min, new_y_min, new_x_max, new_y_max] + bbox[4:]
-                )
-
-        return mosaic, combined_bboxes
+        # Convert back to RGB
+        image = cv2.cvtColor(img_hsv.astype(np.uint8), cv2.COLOR_HSV2RGB)
+        return image, bboxes
 
     def __repr__(self) -> str:
-        return f"Mosaic(p={self.p})"
+        return f"RandomHSV(h={self.h_gain}, s={self.s_gain}, v={self.v_gain})"
 
 
-def _resize_image(image: Image, target_h: int, target_w: int) -> Image:
-    """Simple nearest-neighbor resize for numpy images."""
-    h, w = image.shape[:2]
-    if h == target_h and w == target_w:
-        return image.copy()
+class RandomScale:
+    """Randomly scales the image and adjusts bounding boxes accordingly.
 
-    row_indices = (np.arange(target_h) * h / target_h).astype(int)
-    col_indices = (np.arange(target_w) * w / target_w).astype(int)
-    row_indices = np.clip(row_indices, 0, h - 1)
-    col_indices = np.clip(col_indices, 0, w - 1)
+    When scale > 1 (zoom in): resize larger then random-crop back to original size.
+    When scale < 1 (zoom out): resize smaller then place on gray-padded canvas.
 
-    return image[row_indices][:, col_indices]
+    Args:
+        scale_range: Tuple of (min_scale, max_scale). E.g., (0.5, 1.5).
+    """
+
+    def __init__(self, scale_range: Tuple[float, float] = (0.5, 1.5)):
+        self.scale_min = scale_range[0]
+        self.scale_max = scale_range[1]
+
+    def __call__(self, image: Image, bboxes: BBoxes) -> Tuple[Image, BBoxes]:
+        h, w = image.shape[:2]
+        s = random.uniform(self.scale_min, self.scale_max)
+
+        if abs(s - 1.0) < 1e-3:
+            return image, bboxes
+
+        new_h, new_w = int(h * s), int(w * s)
+
+        # Resize image
+        resized = cv2.resize(image, (new_w, new_h), interpolation=cv2.INTER_LINEAR)
+
+        if s > 1.0:
+            # Zoom in: random crop back to original size
+            crop_x = random.randint(0, new_w - w)
+            crop_y = random.randint(0, new_h - h)
+            image = resized[crop_y:crop_y + h, crop_x:crop_x + w]
+
+            # Bbox transform: shift by crop offset, scale by s
+            # In normalized space of resized image, the crop covers:
+            #   x: [crop_x/new_w, (crop_x+w)/new_w] = [crop_x/new_w, crop_x/new_w + 1/s]
+            ox = crop_x / new_w  # offset in normalized resized space
+            oy = crop_y / new_h
+            new_bboxes = []
+            for bbox in bboxes:
+                x_min = (bbox[0] - ox) * s
+                y_min = (bbox[1] - oy) * s
+                x_max = (bbox[2] - ox) * s
+                y_max = (bbox[3] - oy) * s
+                new_bboxes.append([x_min, y_min, x_max, y_max] + bbox[4:])
+            bboxes = _clip_and_filter_bboxes(new_bboxes)
+        else:
+            # Zoom out: place on gray canvas at random position
+            canvas = np.full((h, w, 3), 114, dtype=np.uint8)
+            # Random placement
+            pad_x = random.randint(0, w - new_w)
+            pad_y = random.randint(0, h - new_h)
+            canvas[pad_y:pad_y + new_h, pad_x:pad_x + new_w] = resized
+            image = canvas
+
+            # Bbox transform: scale down and offset by pad position
+            px = pad_x / w  # normalized pad offset
+            py = pad_y / h
+            new_bboxes = []
+            for bbox in bboxes:
+                x_min = bbox[0] * s + px
+                y_min = bbox[1] * s + py
+                x_max = bbox[2] * s + px
+                y_max = bbox[3] * s + py
+                new_bboxes.append([x_min, y_min, x_max, y_max] + bbox[4:])
+            bboxes = _clip_and_filter_bboxes(new_bboxes)
+
+        return image, bboxes
+
+    def __repr__(self) -> str:
+        return f"RandomScale(range=({self.scale_min}, {self.scale_max}))"
+
+
+class RandomTranslate:
+    """Randomly translates the image and adjusts bounding boxes accordingly.
+
+    Shifts the image by up to ±translate fraction in both x and y.
+    Exposed areas are filled with gray (114, 114, 114).
+
+    Args:
+        translate: Maximum translation fraction. E.g., 0.1 means ±10%.
+    """
+
+    def __init__(self, translate: float = 0.1):
+        self.translate = translate
+
+    def __call__(self, image: Image, bboxes: BBoxes) -> Tuple[Image, BBoxes]:
+        h, w = image.shape[:2]
+        tx = random.uniform(-self.translate, self.translate)
+        ty = random.uniform(-self.translate, self.translate)
+
+        if abs(tx) < 1e-4 and abs(ty) < 1e-4:
+            return image, bboxes
+
+        # Pixel shifts
+        dx = int(tx * w)
+        dy = int(ty * h)
+
+        # Affine translation matrix
+        M = np.array([[1, 0, dx], [0, 1, dy]], dtype=np.float32)
+        image = cv2.warpAffine(
+            image, M, (w, h),
+            borderMode=cv2.BORDER_CONSTANT,
+            borderValue=(114, 114, 114),
+        )
+
+        # Bbox transform: shift in normalized space
+        new_bboxes = []
+        for bbox in bboxes:
+            x_min = bbox[0] + tx
+            y_min = bbox[1] + ty
+            x_max = bbox[2] + tx
+            y_max = bbox[3] + ty
+            new_bboxes.append([x_min, y_min, x_max, y_max] + bbox[4:])
+        bboxes = _clip_and_filter_bboxes(new_bboxes)
+
+        return image, bboxes
+
+    def __repr__(self) -> str:
+        return f"RandomTranslate(translate={self.translate})"
 
 
 def build_augmentation_pipeline(config: dict) -> Compose:
     """Build a composed augmentation pipeline from a configuration dict.
 
-    The config dict format matches the YAML training augmentation config:
+    Supported keys:
 
         augmentation:
+            scale: [0.5, 1.5]        # random scale range
+            translate: 0.1           # random translation fraction
+            hsv_h: 0.015             # hue gain
+            hsv_s: 0.7              # saturation gain
+            hsv_v: 0.4              # value gain
             horizontal_flip: true
-            vertical_flip: false
-            rotation_range: 15
-            brightness_range: [0.8, 1.2]
-            mosaic: true
+            brightness_range: [0.8, 1.2]  # ignored when HSV is active
 
-    This function accepts either the full config (with 'augmentation' key)
-    or just the augmentation sub-dict directly.
+    Multi-image operations (mosaic, mixup) are handled at the Dataset level,
+    not in this pipeline. Keys ``mosaic``, ``mixup``, ``mosaic_off_epochs``,
+    ``rotation_range`` are accepted but ignored here for backward compatibility.
 
     Args:
-        config: Augmentation configuration dictionary.
+        config: Augmentation configuration dictionary. Either the full config
+            (with ``augmentation`` key) or the augmentation sub-dict directly.
 
     Returns:
         A Compose instance chaining the enabled transforms.
@@ -384,29 +334,44 @@ def build_augmentation_pipeline(config: dict) -> Compose:
     else:
         aug_config = config
 
-    transforms = []
+    transforms: list = []
+
+    # Scale (applied first — changes spatial layout)
+    scale = aug_config.get("scale", None)
+    if scale is not None:
+        if isinstance(scale, (list, tuple)) and len(scale) == 2:
+            transforms.append(RandomScale(scale_range=tuple(scale)))
+
+    # Translate
+    translate = aug_config.get("translate", None)
+    if translate is not None and float(translate) > 0:
+        transforms.append(RandomTranslate(translate=float(translate)))
+
+    # HSV color augmentation
+    hsv_h = aug_config.get("hsv_h", None)
+    hsv_s = aug_config.get("hsv_s", None)
+    hsv_v = aug_config.get("hsv_v", None)
+    hsv_active = any(v is not None and float(v) > 0 for v in [hsv_h, hsv_s, hsv_v])
+    if hsv_active:
+        transforms.append(RandomHSV(
+            h_gain=float(hsv_h or 0),
+            s_gain=float(hsv_s or 0),
+            v_gain=float(hsv_v or 0),
+        ))
 
     # Horizontal flip
     if aug_config.get("horizontal_flip", False):
         transforms.append(RandomHorizontalFlip(p=0.5))
 
-    # Vertical flip
+    # Vertical flip (not recommended for road images)
     if aug_config.get("vertical_flip", False):
         transforms.append(RandomVerticalFlip(p=0.5))
 
-    # Rotation
-    rotation_range = aug_config.get("rotation_range", 0)
-    if rotation_range and rotation_range > 0:
-        transforms.append(RandomRotation(max_degrees=float(rotation_range)))
-
-    # Brightness
-    brightness_range = aug_config.get("brightness_range", None)
-    if brightness_range is not None:
-        if isinstance(brightness_range, (list, tuple)) and len(brightness_range) == 2:
-            transforms.append(RandomBrightness(brightness_range=tuple(brightness_range)))
-
-    # Mosaic
-    if aug_config.get("mosaic", False):
-        transforms.append(Mosaic(p=0.5))
+    # Brightness (only if HSV is NOT active — HSV-V subsumes brightness)
+    if not hsv_active:
+        brightness_range = aug_config.get("brightness_range", None)
+        if brightness_range is not None:
+            if isinstance(brightness_range, (list, tuple)) and len(brightness_range) == 2:
+                transforms.append(RandomBrightness(brightness_range=tuple(brightness_range)))
 
     return Compose(transforms)

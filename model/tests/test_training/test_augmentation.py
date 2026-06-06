@@ -5,10 +5,8 @@ import pytest
 
 from model.training.augmentation import (
     Compose,
-    Mosaic,
     RandomBrightness,
     RandomHorizontalFlip,
-    RandomRotation,
     RandomVerticalFlip,
     build_augmentation_pipeline,
 )
@@ -30,6 +28,7 @@ class TestBuildAugmentationPipeline:
     """Tests for build_augmentation_pipeline function."""
 
     def test_full_config_with_augmentation_key(self):
+        # Legacy keys (rotation_range, mosaic) must be silently ignored.
         config = {
             "augmentation": {
                 "horizontal_flip": True,
@@ -41,18 +40,23 @@ class TestBuildAugmentationPipeline:
         }
         pipeline = build_augmentation_pipeline(config)
         assert isinstance(pipeline, Compose)
-        assert len(pipeline.transforms) == 4
+        # hflip + brightness only (rotation/mosaic removed, vflip disabled)
+        assert len(pipeline.transforms) == 2
+        assert isinstance(pipeline.transforms[0], RandomHorizontalFlip)
+        assert isinstance(pipeline.transforms[1], RandomBrightness)
 
     def test_direct_augmentation_dict(self):
         config = {
             "horizontal_flip": True,
             "vertical_flip": True,
-            "rotation_range": 10,
             "brightness_range": [0.9, 1.1],
-            "mosaic": False,
         }
         pipeline = build_augmentation_pipeline(config)
-        assert len(pipeline.transforms) == 4  # hflip, vflip, rotation, brightness
+        # hflip + vflip + brightness
+        assert len(pipeline.transforms) == 3
+        assert isinstance(pipeline.transforms[0], RandomHorizontalFlip)
+        assert isinstance(pipeline.transforms[1], RandomVerticalFlip)
+        assert isinstance(pipeline.transforms[2], RandomBrightness)
 
     def test_empty_config(self):
         pipeline = build_augmentation_pipeline({})
@@ -63,8 +67,6 @@ class TestBuildAugmentationPipeline:
         config = {
             "horizontal_flip": False,
             "vertical_flip": False,
-            "rotation_range": 0,
-            "mosaic": False,
         }
         pipeline = build_augmentation_pipeline(config)
         assert len(pipeline.transforms) == 0
@@ -74,6 +76,12 @@ class TestBuildAugmentationPipeline:
         pipeline = build_augmentation_pipeline(config)
         assert len(pipeline.transforms) == 1
         assert isinstance(pipeline.transforms[0], RandomHorizontalFlip)
+
+    def test_legacy_keys_ignored(self):
+        # rotation_range and mosaic should not produce any transform.
+        config = {"rotation_range": 30, "mosaic": True}
+        pipeline = build_augmentation_pipeline(config)
+        assert len(pipeline.transforms) == 0
 
 
 class TestRandomHorizontalFlip:
@@ -142,61 +150,6 @@ class TestRandomBrightness:
         transform = RandomBrightness(brightness_range=(2.0, 2.0))
         result_img, _ = transform(white, [])
         assert result_img.max() <= 255
-
-
-class TestRandomRotation:
-    """Tests for RandomRotation transform."""
-
-    def test_zero_rotation(self, sample_image, sample_bboxes):
-        transform = RandomRotation(max_degrees=0.0)
-        result_img, result_bboxes = transform(sample_image.copy(), sample_bboxes[:])
-        assert np.array_equal(result_img, sample_image)
-        assert result_bboxes == sample_bboxes
-
-    def test_bboxes_remain_valid(self, sample_image, sample_bboxes):
-        transform = RandomRotation(max_degrees=30.0)
-        _, result_bboxes = transform(sample_image.copy(), sample_bboxes[:])
-        for bbox in result_bboxes:
-            assert 0.0 <= bbox[0] <= 1.0
-            assert 0.0 <= bbox[1] <= 1.0
-            assert 0.0 <= bbox[2] <= 1.0
-            assert 0.0 <= bbox[3] <= 1.0
-            assert bbox[0] < bbox[2]  # x_min < x_max
-            assert bbox[1] < bbox[3]  # y_min < y_max
-
-
-class TestMosaic:
-    """Tests for Mosaic transform."""
-
-    def test_single_image_fallback(self, sample_image, sample_bboxes):
-        transform = Mosaic(p=1.0)
-        result_img, result_bboxes = transform(sample_image.copy(), sample_bboxes[:])
-        # Image should be cropped (different shape or same)
-        assert result_img.ndim == 3
-
-    def test_no_apply(self, sample_image, sample_bboxes):
-        transform = Mosaic(p=0.0)
-        result_img, result_bboxes = transform(sample_image.copy(), sample_bboxes[:])
-        assert np.array_equal(result_img, sample_image)
-        assert result_bboxes == sample_bboxes
-
-    def test_apply_mosaic_4_images(self):
-        images = [
-            np.random.randint(0, 255, (50, 50, 3), dtype=np.uint8) for _ in range(4)
-        ]
-        bboxes_list = [[[0.1, 0.2, 0.5, 0.6]] for _ in range(4)]
-        mosaic_img, mosaic_bboxes = Mosaic.apply_mosaic(images, bboxes_list, (100, 100))
-        assert mosaic_img.shape == (100, 100, 3)
-        assert len(mosaic_bboxes) == 4
-        for bbox in mosaic_bboxes:
-            assert 0.0 <= bbox[0] <= 1.0
-            assert 0.0 <= bbox[1] <= 1.0
-
-    def test_apply_mosaic_wrong_count(self):
-        images = [np.zeros((10, 10, 3), dtype=np.uint8)] * 3
-        bboxes_list = [[[0.1, 0.2, 0.5, 0.6]]] * 3
-        with pytest.raises(ValueError, match="exactly 4"):
-            Mosaic.apply_mosaic(images, bboxes_list, (100, 100))
 
 
 class TestCompose:

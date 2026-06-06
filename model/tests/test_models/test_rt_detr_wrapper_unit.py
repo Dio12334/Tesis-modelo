@@ -384,7 +384,10 @@ class TestRTDETRLossFunction:
         assert detector._loss_fn is mock_criterion
 
     def test_loss_fn_sets_default_hyperparameters_when_missing(self):
-        """Test that _build_loss_fn sets default box, cls, dfl weights when missing."""
+        """RTDETRDetectionLoss does not consume YOLO box/cls/dfl weights, so the
+        wrapper must NOT pollute args with them. This test verifies the wrapper
+        leaves args alone (corrected behavior; the previous YOLO-defaults
+        block was removed in the num_classes fix)."""
         mock_rtdetr = MagicMock()
         mock_model_instance = MagicMock()
         inner_model = MagicMock()
@@ -398,14 +401,15 @@ class TestRTDETRLossFunction:
         with patch("model.models.rt_detr_wrapper.RTDETR", mock_rtdetr):
             detector = RT_DETR_Detector({"model_size": "l", "num_classes": 5})
 
-        # Verify defaults were set
+        # Verify the wrapper did NOT inject YOLO loss hyperparameters.
         args = detector._model.model.args
-        assert args.box == 7.5
-        assert args.cls == 0.5
-        assert args.dfl == 1.5
+        assert not hasattr(args, "box")
+        assert not hasattr(args, "cls")
+        assert not hasattr(args, "dfl")
 
     def test_loss_fn_sets_defaults_from_dict_args(self):
-        """Test that _build_loss_fn handles dict-type args and sets defaults."""
+        """Wrapper must not convert dict args nor inject YOLO loss weights.
+        RTDETRDetectionLoss reads only nc; box/cls/dfl are YOLO-specific."""
         mock_rtdetr = MagicMock()
         mock_model_instance = MagicMock()
         inner_model = MagicMock()
@@ -419,12 +423,12 @@ class TestRTDETRLossFunction:
         with patch("model.models.rt_detr_wrapper.RTDETR", mock_rtdetr):
             detector = RT_DETR_Detector({"model_size": "l", "num_classes": 5})
 
-        # After _build_loss_fn, args should be converted to SimpleNamespace with defaults
+        # args should be left as the original dict, with no injected keys.
         args = detector._model.model.args
-        assert isinstance(args, SimpleNamespace)
-        assert args.box == 7.5
-        assert args.cls == 0.5
-        assert args.dfl == 1.5
+        assert isinstance(args, dict)
+        assert "box" not in args
+        assert "cls" not in args
+        assert "dfl" not in args
 
     def test_loss_fn_none_when_no_criterion_available(self):
         """Test that _loss_fn is None when neither init_criterion nor criterion exist."""

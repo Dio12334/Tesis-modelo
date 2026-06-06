@@ -4,6 +4,7 @@ Provides the EvaluationEngine class that orchestrates model inference,
 metric computation, and report generation.
 """
 
+import logging
 from datetime import datetime, timezone
 from typing import Dict, List, Optional
 
@@ -15,6 +16,8 @@ from model.evaluation.metrics import (
     compute_precision_recall_f1,
 )
 from model.evaluation.report import EvaluationReport
+
+logger = logging.getLogger(__name__)
 
 
 class EvaluationEngine:
@@ -216,6 +219,7 @@ class EvaluationEngine:
                 from torchvision import transforms
 
                 img = Image.open(annotation.image_path).convert("RGB")
+                img_w, img_h = img.size  # PIL: (width, height)
                 transform = transforms.Compose(
                     [
                         transforms.ToTensor(),
@@ -241,15 +245,54 @@ class EvaluationEngine:
                         box = pred_boxes[j]
                         if hasattr(box, "tolist"):
                             box = box.tolist()
-                        boxes.append(box)
+
+                        # Normalize prediction box from pixel-space to [0, 1]
+                        # to match the project's convention (BoundingBox stores
+                        # normalized coords; metrics.compute_iou expects normalized).
+                        # Detector wrappers return xyxy in pixels of the original
+                        # image; we divide by (W, H, W, H).
+                        if (
+                            isinstance(box, (list, tuple))
+                            and len(box) == 4
+                            and img_w > 0
+                            and img_h > 0
+                        ):
+                            x1, y1, x2, y2 = box
+                            box = [
+                                float(x1) / img_w,
+                                float(y1) / img_h,
+                                float(x2) / img_w,
+                                float(y2) / img_h,
+                            ]
 
                         label = pred_labels[j]
                         if hasattr(label, "item"):
                             label = label.item()
-                        # Convert label index to class name if it's an integer
-                        if isinstance(label, int) and label < len(class_names):
+
+                        # Defensive filter: drop predictions whose integer label
+                        # index is outside [0, len(class_names) - 1]. This protects
+                        # against detector wrappers that return raw pretrained-nc
+                        # indices (e.g., 0..79 from a COCO checkpoint) when their
+                        # head was not reshaped to num_classes. After fixing the
+                        # head reshape upstream this branch should never fire,
+                        # but the warning here surfaces such bugs loudly instead
+                        # of silently producing zero mAP.
+                        if isinstance(label, int):
+                            if label < 0 or label >= len(class_names):
+                                logger.warning(
+                                    "Dropping prediction with out-of-range label "
+                                    "index %d (class_names has %d entries) for "
+                                    "image %s. This typically means the detector's "
+                                    "classification head was not reshaped to match "
+                                    "num_classes.",
+                                    label,
+                                    len(class_names),
+                                    image_id,
+                                )
+                                continue
                             label = class_names[label]
                         labels.append(str(label))
+                        boxes.append(box)
 
                         score = pred_scores[j]
                         if hasattr(score, "item"):
