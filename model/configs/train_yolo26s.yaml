@@ -18,11 +18,13 @@ dataset:
   class_mapping: model/configs/rdd2022_classes.yaml
 
 training:
-  epochs: 200
-  early_stopping_patience: 25
-  batch_size: 32
+  epochs: 100
+  early_stopping_patience: 15
+  batch_size: 48
   num_workers: 8
+  prefetch_factor: 3
   use_amp: true
+  use_channels_last: true
   learning_rate: 0.01
   optimizer: MuSGD
   weight_decay: 0.0005
@@ -41,7 +43,7 @@ training:
   augmentation:
     mosaic: 0.5
     mixup: 0.05
-    mosaic_off_epochs: 10
+    mosaic_off_epochs: 8
     horizontal_flip: true
     vertical_flip: false
     hsv_h: 0.015

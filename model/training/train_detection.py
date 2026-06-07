@@ -13,6 +13,7 @@ import argparse
 import inspect
 import logging
 import math
+import platform
 import random
 import signal
 import sys
@@ -60,6 +61,8 @@ class RDD2022TorchDataset(torch.utils.data.Dataset):
         augmentation=None,
         mosaic: float = 0.0,
         mixup: float = 0.0,
+        mosaic_scale_gain: float = 0.5,
+        mosaic_translate: float = 0.1,
     ):
         """Initialize the dataset adapter.
 
@@ -69,6 +72,15 @@ class RDD2022TorchDataset(torch.utils.data.Dataset):
             augmentation: Per-image augmentation Compose pipeline or None.
             mosaic: Probability of applying Mosaic augmentation (0=off, 1=always).
             mixup: Probability of applying MixUp after Mosaic (0=off).
+            mosaic_scale_gain: Random-affine scale gain applied after the 2Sx2S
+                mosaic canvas is built. Final scale is sampled uniformly from
+                ``[1 - gain, 1 + gain]`` (Ultralytics default: 0.5 -> [0.5, 1.5]).
+                Smaller values keep the mosaic closer to a hard crop; larger
+                values let more of the 2Sx2S canvas survive into the SxS output.
+            mosaic_translate: Random-affine translation in normalised units of
+                ``input_size``. Output centre is jittered by
+                ``U[-translate, +translate] * input_size`` on each axis
+                (Ultralytics default: 0.1).
         """
         self._annotations = dataset.get_annotations()
         self._input_size = input_size
@@ -77,6 +89,25 @@ class RDD2022TorchDataset(torch.utils.data.Dataset):
         self._mosaic_p = mosaic
         self._mixup_p = mixup
         self._mosaic_enabled = mosaic > 0  # Can be toggled off for final epochs
+        self._mosaic_scale_gain = float(mosaic_scale_gain)
+        self._mosaic_translate = float(mosaic_translate)
+        # Pre-compute the non-empty annotation pool so mosaic companions are
+        # only ever sampled from images that actually contribute bboxes. With
+        # the RDD2022 train split, ~33% of annotations are empty (~12.7k of
+        # 38.4k); sampling them as mosaic companions wastes 3 of every 4
+        # quadrants on background-only sources. The empirical empty-mosaic
+        # rate before this filter was ~6% from 3-of-3 empty companions
+        # (binomial expectation 3.6% per measure_mosaic_emptiness.py).
+        # We keep the *primary* index unfiltered: empty primaries are still
+        # served by __getitem__ as negatives in the non-mosaic path.
+        self._nonempty_indices: List[int] = [
+            i for i, ann in enumerate(self._annotations) if ann.bounding_boxes
+        ]
+        if not self._nonempty_indices:
+            # Defensive: should never happen on real data. Fall back to all
+            # indices so _build_mosaic still works (every quadrant will just
+            # be background, but the dataset itself is degenerate).
+            self._nonempty_indices = list(range(len(self._annotations)))
         # Map class names to 0-indexed labels (YOLO models don't use a
         # background class; valid indices are 0..num_classes-1)
         self._class_to_idx = {
@@ -86,6 +117,27 @@ class RDD2022TorchDataset(torch.utils.data.Dataset):
             T.Resize((input_size, input_size)),
             T.ToTensor(),
         ])
+
+    def _resolve_class_idx(self, label, context: str = "") -> int:
+        """Resolve a raw class label to its integer index, strictly.
+
+        Raises ValueError with diagnostic context if ``label`` is not in
+        ``self._class_to_idx``. ``_class_to_idx`` is built from the dataset's
+        observed class names at construction, so an unknown label here means
+        the bbox was produced by code (e.g. a multi-image augmentation) that
+        injected a label outside the registered taxonomy. We refuse to
+        silently coerce such labels to class 0 because that masks the real
+        bug while polluting the training signal with mislabelled positives.
+        """
+        try:
+            return self._class_to_idx[label]
+        except KeyError:
+            known = sorted(self._class_to_idx.keys())
+            ctx = f" ({context})" if context else ""
+            raise ValueError(
+                f"Unknown class label {label!r}{ctx}. "
+                f"Known labels: {known}"
+            ) from None
 
     @property
     def class_names(self) -> List[str]:
@@ -141,78 +193,184 @@ class RDD2022TorchDataset(torch.utils.data.Dataset):
         return image_np, bboxes
 
     def _build_mosaic(self, idx: int) -> Tuple[np.ndarray, List[List]]:
-        """Build a 4-image mosaic centered at a random point.
+        """Build a 4-image mosaic, Ultralytics-style.
 
-        Samples 3 additional random images and places all 4 into a 2x2 grid
-        with a random center point in [0.25*size, 0.75*size] for both axes
-        (Ultralytics default).
+        Algorithm (matches ``ultralytics.data.augment.Mosaic`` followed by
+        ``RandomPerspective``):
+
+        1. Allocate a ``2S x 2S`` canvas filled with grey (114).
+        2. Paste each of 4 source images (already resized to ``S x S`` by
+           ``_load_image_and_bboxes``) at native resolution into one of the
+           four fixed quadrants of the canvas:
+
+               +--------+--------+
+               | TL (0) | TR (1) |
+               +--------+--------+
+               | BL (2) | BR (3) |
+               +--------+--------+
+
+        3. Translate each source bbox into canvas pixel coordinates.
+        4. Apply a random affine transform that warps the ``2S x 2S`` canvas
+           down to ``S x S``: scale ~ ``U[1 - gain, 1 + gain]`` (default gain
+           0.5 -> [0.5, 1.5]) and translation jitter
+           ``U[-translate, +translate] * S`` on each axis. Bbox corners are
+           transformed analytically by the same affine matrix, then clipped
+           to the output frame.
+        5. ``_clip_and_filter_bboxes`` drops anything below ``MIN_BBOX_AREA``.
+
+        Replaces the previous ``(xc, yc)`` centre-crop. The crop was found to
+        discard ~18.5% of mosaics entirely (avg 1.98 bboxes/mosaic) because
+        only the corner of each quadrant nearest ``(xc, yc)`` survived; the
+        random affine preserves bboxes from across the whole canvas by
+        downscale (when scale < 1) instead of by hard crop.
 
         Args:
             idx: Primary image index.
 
         Returns:
-            Tuple of (mosaic_image [input_size, input_size, 3], merged_bboxes).
+            Tuple of ``(mosaic_image [S, S, 3], merged_bboxes)`` with
+            bboxes in normalised ``[0, 1]`` output coordinates.
         """
         s = self._input_size
-        # Random mosaic center
-        cx = int(random.uniform(0.25 * s, 0.75 * s))
-        cy = int(random.uniform(0.25 * s, 0.75 * s))
+        canvas_size = 2 * s
 
-        # Sample 3 additional indices
-        n = len(self._annotations)
-        indices = [idx] + [random.randint(0, n - 1) for _ in range(3)]
+        # Sample 3 additional indices from the *non-empty* pool only.
+        # Companions sampled from the full annotation list (including the
+        # ~33% that are empty on RDD2022 train) wasted ~6% of mosaics
+        # entirely. The primary idx is left as-is.
+        pool = self._nonempty_indices
+        pool_n = len(pool)
+        indices = [idx] + [
+            pool[random.randint(0, pool_n - 1)] for _ in range(3)
+        ]
 
-        # Canvas (gray fill like Ultralytics)
-        mosaic_img = np.full((s, s, 3), 114, dtype=np.uint8)
-        merged_bboxes: List[List] = []
+        # 2Sx2S canvas with grey fill (Ultralytics convention)
+        mosaic_img = np.full((canvas_size, canvas_size, 3), 114, dtype=np.uint8)
+        # bboxes in canvas pixel coords (x1, y1, x2, y2, label)
+        canvas_bboxes: List[List] = []
+
+        # Fixed quadrant top-left corners on the canvas
+        quadrants = [(0, 0), (s, 0), (0, s), (s, s)]  # TL, TR, BL, BR
 
         for i, img_idx in enumerate(indices):
             img_np, bboxes = self._load_image_and_bboxes(img_idx)
+            h, w = img_np.shape[:2]  # == (s, s) by contract
+            x_off, y_off = quadrants[i]
 
-            # Determine placement region for each quadrant
-            if i == 0:  # top-left
-                # Image region that maps to canvas [0:cy, 0:cx]
-                x1c, y1c, x2c, y2c = 0, 0, cx, cy
-            elif i == 1:  # top-right
-                x1c, y1c, x2c, y2c = cx, 0, s, cy
-            elif i == 2:  # bottom-left
-                x1c, y1c, x2c, y2c = 0, cy, cx, s
-            else:  # bottom-right
-                x1c, y1c, x2c, y2c = cx, cy, s, s
+            mosaic_img[y_off:y_off + h, x_off:x_off + w] = img_np
 
-            # Target region dimensions on canvas
-            tw = x2c - x1c
-            th = y2c - y1c
-            if tw <= 0 or th <= 0:
-                del img_np  # Free early
-                continue
-
-            # Resize image to fit into its quadrant
-            mosaic_img[y1c:y2c, x1c:x2c] = cv2.resize(
-                img_np, (tw, th), interpolation=cv2.INTER_LINEAR
-            )
-            del img_np  # Free source image immediately after placement
-
-            # Transform bboxes: map from normalized [0,1] of original image
-            # to normalized [0,1] of the mosaic canvas
             for bbox in bboxes:
-                # Map bbox from original image space to canvas pixel space
-                bx1 = x1c + bbox[0] * tw
-                by1 = y1c + bbox[1] * th
-                bx2 = x1c + bbox[2] * tw
-                by2 = y1c + bbox[3] * th
-                # Normalize to mosaic canvas [0, 1]
-                nx1 = bx1 / s
-                ny1 = by1 / s
-                nx2 = bx2 / s
-                ny2 = by2 / s
-                merged_bboxes.append([nx1, ny1, nx2, ny2, bbox[4]])
+                # source normalised [0,1] -> source pixels -> canvas pixels
+                cx1 = bbox[0] * w + x_off
+                cy1 = bbox[1] * h + y_off
+                cx2 = bbox[2] * w + x_off
+                cy2 = bbox[3] * h + y_off
+                canvas_bboxes.append([cx1, cy1, cx2, cy2, bbox[4]])
 
-        # Clip and filter degenerate boxes
+            del img_np
+
+        # Random-affine warp: 2Sx2S canvas -> SxS output
+        out_img, out_bboxes = self._random_affine_mosaic(
+            mosaic_img, canvas_bboxes, target_size=s
+        )
+        del mosaic_img  # release 2Sx2S canvas
+
+        # Drop anything below MIN_BBOX_AREA (and clip to [0,1])
         from model.training.augmentation import _clip_and_filter_bboxes
-        merged_bboxes = _clip_and_filter_bboxes(merged_bboxes)
+        out_bboxes = _clip_and_filter_bboxes(out_bboxes)
 
-        return mosaic_img, merged_bboxes
+        return out_img, out_bboxes
+
+    def _random_affine_mosaic(
+        self,
+        canvas_img: np.ndarray,
+        canvas_bboxes: List[List],
+        target_size: int,
+    ) -> Tuple[np.ndarray, List[List]]:
+        """Apply a random scale + translate affine to ``canvas_img`` and warp
+        it down to ``target_size x target_size``.
+
+        Implements the same operation Ultralytics performs after Mosaic via
+        ``RandomPerspective(degrees=0, scale=gain, translate=t)``: a 2x3
+        affine matrix is constructed that
+
+        - centres the input canvas at the origin,
+        - scales by ``s ~ U[1 - gain, 1 + gain]``,
+        - translates so the canvas centre lands at the *output* centre +
+          a jitter of ``U[-translate, +translate] * target_size`` on each
+          axis.
+
+        Bbox corners are transformed by the same affine matrix and clipped
+        to ``[0, target_size]``. Output bboxes are returned normalised.
+
+        Rotation, shear, and perspective are explicitly disabled because
+        road-camera images are orientation-sensitive (a flipped pothole is
+        not a valid training example).
+
+        Args:
+            canvas_img: ``HxWx3 uint8`` mosaic canvas (typically 2Sx2S).
+            canvas_bboxes: bboxes in canvas pixel coords as
+                ``[x1, y1, x2, y2, label]``.
+            target_size: Side length of the square output image.
+
+        Returns:
+            Tuple of ``(out_img [target_size, target_size, 3] uint8,
+                       out_bboxes_normalised)``.
+        """
+        canvas_h, canvas_w = canvas_img.shape[:2]
+
+        gain = self._mosaic_scale_gain
+        scale = random.uniform(max(0.0, 1.0 - gain), 1.0 + gain)
+        # Translation jitter in *output* pixel units
+        tx = random.uniform(-self._mosaic_translate, self._mosaic_translate) * target_size
+        ty = random.uniform(-self._mosaic_translate, self._mosaic_translate) * target_size
+
+        cx_in = canvas_w / 2.0
+        cy_in = canvas_h / 2.0
+        cx_out = target_size / 2.0 + tx
+        cy_out = target_size / 2.0 + ty
+
+        # affine: out = scale * (in - input_centre) + output_centre
+        b_x = cx_out - scale * cx_in
+        b_y = cy_out - scale * cy_in
+        M = np.array(
+            [[scale, 0.0, b_x],
+             [0.0, scale, b_y]],
+            dtype=np.float32,
+        )
+
+        out_img = cv2.warpAffine(
+            canvas_img,
+            M,
+            (target_size, target_size),
+            flags=cv2.INTER_LINEAR,
+            borderValue=(114, 114, 114),
+        )
+
+        out_bboxes: List[List] = []
+        for bbox in canvas_bboxes:
+            x1, y1, x2, y2 = bbox[0], bbox[1], bbox[2], bbox[3]
+            nx1 = scale * x1 + b_x
+            ny1 = scale * y1 + b_y
+            nx2 = scale * x2 + b_x
+            ny2 = scale * y2 + b_y
+            # Clip to output frame
+            cx1 = max(0.0, min(float(target_size), nx1))
+            cy1 = max(0.0, min(float(target_size), ny1))
+            cx2 = max(0.0, min(float(target_size), nx2))
+            cy2 = max(0.0, min(float(target_size), ny2))
+            if cx2 <= cx1 or cy2 <= cy1:
+                continue
+            # Normalise to [0, 1]
+            out_bboxes.append([
+                cx1 / target_size,
+                cy1 / target_size,
+                cx2 / target_size,
+                cy2 / target_size,
+                bbox[4],
+            ])
+
+        return out_img, out_bboxes
 
     def _apply_mixup(self, img1: np.ndarray, bboxes1: List[List]) -> Tuple[np.ndarray, List[List]]:
         """Apply MixUp by blending with a random second image.
@@ -281,7 +439,9 @@ class RDD2022TorchDataset(torch.utils.data.Dataset):
                 y2 = bbox[3] * self._input_size
                 if x2 > x1 and y2 > y1:
                     boxes.append([x1, y1, x2, y2])
-                    class_idx = self._class_to_idx.get(bbox[4], 0)
+                    class_idx = self._resolve_class_idx(
+                        bbox[4], context=f"mosaic primary idx={idx}"
+                    )
                     labels.append(class_idx)
         else:
             # --- Single-image path (original or with per-image augmentation) ---
@@ -332,7 +492,9 @@ class RDD2022TorchDataset(torch.utils.data.Dataset):
                     y2 = bbox[3] * self._input_size
                     if x2 > x1 and y2 > y1:
                         boxes.append([x1, y1, x2, y2])
-                        class_idx = self._class_to_idx.get(bbox[4], 0)
+                        class_idx = self._resolve_class_idx(
+                            bbox[4], context=f"image={annotation.image_path}"
+                        )
                         labels.append(class_idx)
             else:
                 image_tensor = self._transform(image)
@@ -346,7 +508,10 @@ class RDD2022TorchDataset(torch.utils.data.Dataset):
                     y2 = bbox.y_max * self._input_size
                     if x2 > x1 and y2 > y1:
                         boxes.append([x1, y1, x2, y2])
-                        class_idx = self._class_to_idx.get(bbox.class_label, 0)
+                        class_idx = self._resolve_class_idx(
+                            bbox.class_label,
+                            context=f"image={annotation.image_path}",
+                        )
                         labels.append(class_idx)
 
         if boxes:
@@ -426,6 +591,8 @@ def train(config_path: str, verbose: bool = False) -> dict:
     use_amp = training_config.get("use_amp", True)
     num_workers = training_config.get("num_workers", 4)
     early_stopping_patience = training_config.get("early_stopping_patience", 15)
+    use_channels_last = bool(training_config.get("use_channels_last", False))
+    prefetch_factor = int(training_config.get("prefetch_factor", 2))
 
     # Reproducibility seed
     seed = training_config.get("seed", 42)
@@ -488,6 +655,21 @@ def train(config_path: str, verbose: bool = False) -> dict:
         model.to(device)
     logger.info("Model moved to %s", device)
 
+    # Convert model to channels_last memory format for Tensor Core optimization.
+    # Must happen AFTER .to(device) and BEFORE torch.compile (compile traces graph).
+    # Best-effort: skip if any op rejects the layout.
+    if use_channels_last and device.type == "cuda":
+        try:
+            if hasattr(model, "_model") and hasattr(model._model, "model"):
+                model._model.model = model._model.model.to(memory_format=torch.channels_last)
+            elif hasattr(model, "_model") and hasattr(model._model, "to"):
+                model._model = model._model.to(memory_format=torch.channels_last)
+            elif hasattr(model, "model") and hasattr(model.model, "to"):
+                model.model = model.model.to(memory_format=torch.channels_last)
+            logger.info("Model converted to channels_last memory format")
+        except Exception as e:
+            logger.warning("channels_last conversion failed, continuing in default layout: %s", e)
+
     # Compile model for faster CUDA execution (torch.compile, requires PyTorch 2.0+)
     if hasattr(torch, "compile") and device.type == "cuda":
         try:
@@ -535,6 +717,9 @@ def train(config_path: str, verbose: bool = False) -> dict:
     effective_workers = num_workers
     mp_context = "spawn" if is_windows and effective_workers > 0 else None
 
+    # prefetch_factor is only valid when num_workers > 0; PyTorch raises otherwise.
+    prefetch_kwargs = {"prefetch_factor": prefetch_factor} if effective_workers > 0 else {}
+
     # Create data loaders
     train_loader = torch.utils.data.DataLoader(
         train_torch,
@@ -545,6 +730,7 @@ def train(config_path: str, verbose: bool = False) -> dict:
         persistent_workers=effective_workers > 0,
         multiprocessing_context=mp_context,
         collate_fn=collate_fn,
+        **prefetch_kwargs,
     )
     val_loader = torch.utils.data.DataLoader(
         val_torch,
@@ -555,6 +741,7 @@ def train(config_path: str, verbose: bool = False) -> dict:
         persistent_workers=effective_workers > 0,
         multiprocessing_context=mp_context,
         collate_fn=collate_fn,
+        **prefetch_kwargs,
     )
 
     # --- Construct optimizer from model.get_parameters() ---
