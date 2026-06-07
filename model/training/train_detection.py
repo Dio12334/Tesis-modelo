@@ -13,6 +13,7 @@ import argparse
 import inspect
 import logging
 import math
+import platform
 import random
 import signal
 import sys
@@ -426,6 +427,8 @@ def train(config_path: str, verbose: bool = False) -> dict:
     use_amp = training_config.get("use_amp", True)
     num_workers = training_config.get("num_workers", 4)
     early_stopping_patience = training_config.get("early_stopping_patience", 15)
+    use_channels_last = bool(training_config.get("use_channels_last", False))
+    prefetch_factor = int(training_config.get("prefetch_factor", 2))
 
     # Reproducibility seed
     seed = training_config.get("seed", 42)
@@ -488,6 +491,21 @@ def train(config_path: str, verbose: bool = False) -> dict:
         model.to(device)
     logger.info("Model moved to %s", device)
 
+    # Convert model to channels_last memory format for Tensor Core optimization.
+    # Must happen AFTER .to(device) and BEFORE torch.compile (compile traces graph).
+    # Best-effort: skip if any op rejects the layout.
+    if use_channels_last and device.type == "cuda":
+        try:
+            if hasattr(model, "_model") and hasattr(model._model, "model"):
+                model._model.model = model._model.model.to(memory_format=torch.channels_last)
+            elif hasattr(model, "_model") and hasattr(model._model, "to"):
+                model._model = model._model.to(memory_format=torch.channels_last)
+            elif hasattr(model, "model") and hasattr(model.model, "to"):
+                model.model = model.model.to(memory_format=torch.channels_last)
+            logger.info("Model converted to channels_last memory format")
+        except Exception as e:
+            logger.warning("channels_last conversion failed, continuing in default layout: %s", e)
+
     # Compile model for faster CUDA execution (torch.compile, requires PyTorch 2.0+)
     if hasattr(torch, "compile") and device.type == "cuda":
         try:
@@ -535,6 +553,9 @@ def train(config_path: str, verbose: bool = False) -> dict:
     effective_workers = num_workers
     mp_context = "spawn" if is_windows and effective_workers > 0 else None
 
+    # prefetch_factor is only valid when num_workers > 0; PyTorch raises otherwise.
+    prefetch_kwargs = {"prefetch_factor": prefetch_factor} if effective_workers > 0 else {}
+
     # Create data loaders
     train_loader = torch.utils.data.DataLoader(
         train_torch,
@@ -545,6 +566,7 @@ def train(config_path: str, verbose: bool = False) -> dict:
         persistent_workers=effective_workers > 0,
         multiprocessing_context=mp_context,
         collate_fn=collate_fn,
+        **prefetch_kwargs,
     )
     val_loader = torch.utils.data.DataLoader(
         val_torch,
@@ -555,6 +577,7 @@ def train(config_path: str, verbose: bool = False) -> dict:
         persistent_workers=effective_workers > 0,
         multiprocessing_context=mp_context,
         collate_fn=collate_fn,
+        **prefetch_kwargs,
     )
 
     # --- Construct optimizer from model.get_parameters() ---
