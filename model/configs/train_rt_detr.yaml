@@ -8,17 +8,17 @@ model:
     num_classes: 5
     confidence_threshold: 0.25
     iou_threshold: 0.7
-    freeze_layers: 10  # Number of initial layers to freeze (0 to total_layers). Optional.
+    freeze_layers: 26  # Number of initial layers to freeze (0 to total_layers). Optional.
 
 dataset:
   type: rdd2022
-  path: model/data/rdd2022/sample
+  path: model/data/rdd2022/complete
   class_mapping: model/configs/rdd2022_classes.yaml
 
 training:
   epochs: 100
   early_stopping_patience: 25
-  batch_size: 4
+  batch_size: 16
   num_workers: 4
   use_amp: true
   learning_rate: 0.0001
@@ -38,6 +38,9 @@ training:
 evaluation:
   iou_thresholds: [0.25, 0.5, 0.75]
   confidence_threshold: 0.25
+  # F1-sweep operating points (Phase-2 evaluation architecture). Required.
+  confidence_thresholds_sweep:
+    [0.05, 0.10, 0.15, 0.20, 0.25, 0.30, 0.35, 0.40, 0.45, 0.50]
 
 output:
   checkpoint_dir: ./checkpoints/rt_detr

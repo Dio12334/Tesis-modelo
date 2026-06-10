@@ -267,6 +267,7 @@ class TestModelAgnosticControlFlow:
                         "split": "val",
                         "confidence_threshold": 0.25,
                         "iou_threshold": 0.5,
+                        "confidence_thresholds_sweep": [0.05, 0.25, 0.50],
                         "output_dir": str(tmp_path / "output" / model_name),
                     },
                     "checkpoint": {"path": str(ckpt_path)},

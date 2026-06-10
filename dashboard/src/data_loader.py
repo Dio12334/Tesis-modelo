@@ -63,6 +63,7 @@ class EvaluationReport:
     iou_threshold: float
     metrics: dict
     confusion_matrix: list[list[int]]
+    display_class_names: Optional[list[str]] = None
 
 
 @dataclass
@@ -177,6 +178,7 @@ def load_evaluation_report(filepath: Path) -> EvaluationReport:
         iou_threshold=data["iou_threshold"],
         metrics=data["metrics"],
         confusion_matrix=data["confusion_matrix"],
+        display_class_names=data.get("display_class_names"),
     )
 
 
