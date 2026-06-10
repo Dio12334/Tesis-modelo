@@ -36,6 +36,9 @@ training:
 evaluation:
   iou_thresholds: [0.5]
   confidence_threshold: 0.3
+  # F1-sweep operating points (Phase-2 evaluation architecture). Required.
+  confidence_thresholds_sweep:
+    [0.05, 0.10, 0.15, 0.20, 0.25, 0.30, 0.35, 0.40, 0.45, 0.50]
 
 output:
   checkpoint_dir: ./checkpoints/ssd_mobilenetv3
