@@ -390,3 +390,169 @@ def compute_confusion_matrix(
                         matrix[gt_class_idx, bg_idx] += 1
 
     return matrix
+
+
+# ---------------------------------------------------------------------------
+# Confidence-threshold sweep helpers (Phase-2 evaluation architecture)
+# ---------------------------------------------------------------------------
+
+
+_SWEEP_REQUIRED_KEYS = ("confidence", "precision", "recall", "f1")
+
+
+def compute_precision_recall_f1_sweep(
+    predictions: List[dict],
+    ground_truths: List[dict],
+    confidence_thresholds: List[float],
+    iou_threshold: float = 0.5,
+) -> List[Dict[str, float]]:
+    """Compute overall precision/recall/F1 across a list of confidence thresholds.
+
+    The evaluation pipeline needs to surface a curve of (precision, recall, F1)
+    points so downstream tooling (comparison reports, the Pham-style F1
+    benchmark) can pick a deployment-friendly confidence threshold without
+    re-running inference. This helper delegates each point to
+    :func:`compute_precision_recall_f1`, so the per-point semantics stay
+    identical to the rest of the evaluation stack.
+
+    Args:
+        predictions: List of prediction dicts (image_id, boxes, labels, scores).
+        ground_truths: List of ground-truth dicts (image_id, boxes, labels).
+        confidence_thresholds: Confidence thresholds to evaluate. Each value
+            must be in ``[0.0, 1.0]``. Order does not matter; the returned
+            sweep is sorted ascending by confidence.
+        iou_threshold: IoU threshold for matching (forwarded as-is).
+
+    Returns:
+        A list of dicts with keys ``confidence``, ``precision``, ``recall``,
+        ``f1``. Length equals ``len(confidence_thresholds)``; the list is
+        sorted ascending by ``confidence``.
+
+    Raises:
+        ValueError: If ``confidence_thresholds`` is empty or any value is
+            outside ``[0.0, 1.0]``.
+    """
+    if len(confidence_thresholds) == 0:
+        raise ValueError(
+            "confidence_thresholds must contain at least one value; got an "
+            "empty list."
+        )
+    for conf in confidence_thresholds:
+        if not (0.0 <= float(conf) <= 1.0):
+            raise ValueError(
+                f"confidence threshold {conf!r} is outside [0.0, 1.0]"
+            )
+
+    sorted_thresholds = sorted(float(c) for c in confidence_thresholds)
+    sweep: List[Dict[str, float]] = []
+    for conf in sorted_thresholds:
+        prf1 = compute_precision_recall_f1(
+            predictions=predictions,
+            ground_truths=ground_truths,
+            confidence_threshold=conf,
+            iou_threshold=iou_threshold,
+        )
+        sweep.append(
+            {
+                "confidence": float(conf),
+                "precision": float(prf1["precision"]),
+                "recall": float(prf1["recall"]),
+                "f1": float(prf1["f1"]),
+            }
+        )
+    return sweep
+
+
+def find_best_f1(sweep: List[Dict[str, float]]) -> Dict[str, float]:
+    """Return the sweep entry with the highest F1.
+
+    Ties on F1 are broken by preferring the entry with the **higher**
+    confidence threshold (more conservative deployment point — fewer false
+    positives at the same operating F1).
+
+    Args:
+        sweep: Output of :func:`compute_precision_recall_f1_sweep`. Each entry
+            must carry ``confidence``, ``precision``, ``recall``, and ``f1``.
+
+    Returns:
+        The sweep entry (a new dict copy) with the highest F1.
+
+    Raises:
+        ValueError: If ``sweep`` is empty or any entry is missing one of the
+            required keys.
+    """
+    if len(sweep) == 0:
+        raise ValueError("Cannot find best F1 in an empty sweep.")
+
+    for idx, entry in enumerate(sweep):
+        for key in _SWEEP_REQUIRED_KEYS:
+            if key not in entry:
+                raise ValueError(
+                    f"sweep entry at index {idx} is missing required key "
+                    f"{key!r}; entry={entry!r}"
+                )
+
+    # max() picks the first occurrence on ties; we want the *last* tied entry
+    # at the highest confidence, so sort by (f1, confidence) and take the last.
+    sorted_entries = sorted(sweep, key=lambda e: (e["f1"], e["confidence"]))
+    best = sorted_entries[-1]
+    return dict(best)
+
+
+def compute_per_class_f1_sweep(
+    predictions: List[dict],
+    ground_truths: List[dict],
+    class_names: List[str],
+    confidence_thresholds: List[float],
+    iou_threshold: float = 0.5,
+) -> Dict[str, Dict[str, float]]:
+    """For each class, sweep confidence and return the best (P, R, F1) point.
+
+    Filters predictions and ground truths to a single class at a time, then
+    delegates to :func:`compute_precision_recall_f1_sweep` and
+    :func:`find_best_f1` for the per-class best point. The resulting dict is
+    consumed by the evaluation report and downstream comparison tooling.
+
+    Args:
+        predictions: List of prediction dicts.
+        ground_truths: List of ground-truth dicts.
+        class_names: Ordered class names whose per-class best F1 to compute.
+        confidence_thresholds: Confidence thresholds to sweep (same contract
+            as :func:`compute_precision_recall_f1_sweep`).
+        iou_threshold: IoU threshold for matching.
+
+    Returns:
+        Dict ``{class_name: {confidence, precision, recall, f1}}`` containing
+        one entry per name in ``class_names``.
+    """
+    result: Dict[str, Dict[str, float]] = {}
+    for cls in class_names:
+        cls_preds: List[dict] = []
+        for pred in predictions:
+            keep = [i for i, lbl in enumerate(pred["labels"]) if lbl == cls]
+            cls_preds.append(
+                {
+                    "image_id": pred["image_id"],
+                    "boxes": [pred["boxes"][i] for i in keep],
+                    "labels": [pred["labels"][i] for i in keep],
+                    "scores": [pred["scores"][i] for i in keep],
+                }
+            )
+        cls_gts: List[dict] = []
+        for gt in ground_truths:
+            keep = [i for i, lbl in enumerate(gt["labels"]) if lbl == cls]
+            cls_gts.append(
+                {
+                    "image_id": gt["image_id"],
+                    "boxes": [gt["boxes"][i] for i in keep],
+                    "labels": [gt["labels"][i] for i in keep],
+                }
+            )
+        sweep = compute_precision_recall_f1_sweep(
+            predictions=cls_preds,
+            ground_truths=cls_gts,
+            confidence_thresholds=confidence_thresholds,
+            iou_threshold=iou_threshold,
+        )
+        result[cls] = find_best_f1(sweep)
+    return result

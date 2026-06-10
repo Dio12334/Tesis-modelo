@@ -53,6 +53,7 @@ def _minimal_config():
             "split": "val",
             "confidence_threshold": 0.25,
             "iou_threshold": 0.5,
+            "confidence_thresholds_sweep": [0.05, 0.25, 0.50],
         },
         "checkpoint": {"path": "/fake/checkpoint/best_model.pt"},
     }
