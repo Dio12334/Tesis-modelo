@@ -7,18 +7,18 @@ model:
     input_size: 640
     num_classes: 5
     confidence_threshold: 0.25
-    iou_threshold: 0.7
-    freeze_layers: 10  # Number of initial layers to freeze (0 to total_layers). Optional.
+    iou_threshold: 0.5
+    freeze_layers: 19  # Number of initial layers to freeze (0 to total_layers). Optional.
 
 dataset:
   type: rdd2022
-  path: model/data/rdd2022/sample
+  path: model/data/rdd2022/
   class_mapping: model/configs/rdd2022_classes.yaml
 
 training:
   epochs: 100
   early_stopping_patience: 25
-  batch_size: 4
+  batch_size: 16
   num_workers: 4
   use_amp: true
   learning_rate: 0.0001
@@ -31,9 +31,20 @@ training:
   checkpoint_dir: ./checkpoints/rt_detr
   log_interval: 10
   seed: 42
+  loss:
+    label_smoothing: 0.01
+    focal_loss: true
+    focal_gamma: 1.5
+    focal_alpha: 0.25
   augmentation:
+    mixup: 0.05
     horizontal_flip: true
-    brightness_range: [0.8, 1.2]
+    vertical_flip: false
+    hsv_h: 0.015
+    hsv_s: 0.5
+    hsv_v: 0.4
+    scale: [0.9, 1.1]
+    translate: 0.1
 
 evaluation:
   iou_thresholds: [0.25, 0.5, 0.75]

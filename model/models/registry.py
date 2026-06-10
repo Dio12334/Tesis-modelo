@@ -1,10 +1,13 @@
 """Model registry and base detector interface for the Road Damage Evaluation Framework."""
 
+import logging
 from abc import ABC, abstractmethod
 from pathlib import Path
 from typing import TYPE_CHECKING, Dict, List
 
 from model.exceptions import ConfigurationError, ModelNotFoundError
+
+logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
     import torch
@@ -215,12 +218,19 @@ class ModelRegistry:
             ):
                 return model_cls.get_config_schema()
 
-            # For regular methods, create a minimal instance to get schema
-            # This is a common pattern: instantiate with empty config to get schema
-            # But that would fail if __init__ validates. Instead, use object.__new__
+            # For regular methods, create a minimal instance without calling __init__
             instance = object.__new__(model_cls)
-            return instance.get_config_schema()
-        except (TypeError, AttributeError):
+            try:
+                return instance.get_config_schema()
+            except AttributeError:
+                # get_config_schema() reads __init__ state — it should be a @classmethod
+                logger.warning(
+                    "get_config_schema() on %s accesses instance attributes; "
+                    "declare it as a @classmethod to avoid this.",
+                    model_cls.__name__,
+                )
+                return {}
+        except TypeError:
             return {}
 
     @classmethod

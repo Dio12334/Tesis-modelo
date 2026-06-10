@@ -13,6 +13,7 @@ import argparse
 import inspect
 import logging
 import math
+import platform
 import random
 import signal
 import sys
@@ -98,6 +99,48 @@ class RDD2022TorchDataset(torch.utils.data.Dataset):
     def set_mosaic_enabled(self, enabled: bool) -> None:
         """Enable or disable Mosaic augmentation (for mosaic_off_epochs)."""
         self._mosaic_enabled = enabled
+
+    def compute_sample_weights(self) -> List[float]:
+        """Compute per-image sampling weights for class-balanced training.
+
+        Uses inverse-frequency class weighting: rare classes get higher weight.
+        Each image's weight is the MAX weight among the classes it contains,
+        so an image with a rare class (e.g. pothole) is oversampled even if it
+        also contains common classes.
+
+        Returns:
+            List of float weights, one per annotation, suitable for
+            torch.utils.data.WeightedRandomSampler.
+        """
+        # Count occurrences per class label
+        class_counts: dict = {name: 0 for name in self._class_names}
+        for ann in self._annotations:
+            present = set()
+            for bbox in ann.bounding_boxes:
+                if bbox.class_label in class_counts:
+                    present.add(bbox.class_label)
+            for label in present:
+                class_counts[label] += 1
+
+        # Inverse-frequency class weight (avoid div-by-zero)
+        total = sum(class_counts.values()) or 1
+        class_weight = {
+            name: (total / (count + 1)) for name, count in class_counts.items()
+        }
+
+        # Per-image weight = max class weight among present classes
+        weights: List[float] = []
+        for ann in self._annotations:
+            present = [
+                bbox.class_label for bbox in ann.bounding_boxes
+                if bbox.class_label in class_weight
+            ]
+            if present:
+                weights.append(max(class_weight[c] for c in present))
+            else:
+                # Background-only / empty image: lowest weight
+                weights.append(1.0)
+        return weights
 
     def __len__(self) -> int:
         return len(self._annotations)
@@ -252,11 +295,22 @@ class RDD2022TorchDataset(torch.utils.data.Dataset):
 
     def __getitem__(self, idx: int) -> Tuple[torch.Tensor, dict]:
         # --- Multi-image augmentations (Mosaic + MixUp) ---
+        # MixUp is independent of Mosaic: it can trigger on its own (blending
+        # two single images) or after a mosaic. Previously MixUp was gated by
+        # Mosaic, so with mosaic=0 MixUp never fired regardless of its prob.
         use_mosaic = self._mosaic_enabled and random.random() < self._mosaic_p
-        use_mixup = use_mosaic and random.random() < self._mixup_p
+        use_mixup = self._mixup_p > 0 and random.random() < self._mixup_p
 
-        if use_mosaic:
-            image_np, bboxes = self._build_mosaic(idx)
+        if use_mosaic or use_mixup:
+            if use_mosaic:
+                image_np, bboxes = self._build_mosaic(idx)
+            else:
+                # MixUp-only path: load the primary image as the base
+                image_np, bboxes = self._load_image_and_bboxes(idx)
+                image_np = cv2.resize(
+                    image_np, (self._input_size, self._input_size),
+                    interpolation=cv2.INTER_LINEAR,
+                )
 
             if use_mixup:
                 image_np, bboxes = self._apply_mixup(image_np, bboxes)
@@ -371,11 +425,217 @@ def collate_fn(batch):
 
 
 # -------------------------------------------------------------------------
+# mAP validation (Group A)
+# -------------------------------------------------------------------------
+
+
+@torch.no_grad()
+def evaluate_map(model, val_loader, class_names, input_size, device,
+                 confidence_threshold=0.25, max_batches=None):
+    """Compute mAP@0.5 on the validation set using model.forward().
+
+    Runs the detector in eval mode over the val_loader (images already resized
+    to input_size, boxes in pixel coords of input_size). Predictions and ground
+    truths are normalized to [0,1] and labels mapped to class-name strings, then
+    fed to compute_map().
+
+    Args:
+        model: BaseDetector with set_eval_mode() and forward().
+        val_loader: DataLoader yielding (images, targets) like the training loop.
+        class_names: Ordered list of class-name strings (index -> name).
+        input_size: Square input size used to normalize boxes.
+        device: torch device.
+        confidence_threshold: Drop predictions below this score.
+        max_batches: If set, evaluate only the first N batches (subset eval).
+
+    Returns:
+        Dict from compute_map: {"map_50", "map_50_95", "per_class_ap"}.
+    """
+    from model.evaluation.metrics import compute_map
+
+    model.set_eval_mode()
+    predictions: List[dict] = []
+    ground_truths: List[dict] = []
+
+    img_counter = 0
+    for batch_idx, (images, targets) in enumerate(val_loader):
+        if max_batches is not None and batch_idx >= max_batches:
+            break
+
+        batch = torch.stack([img.to(device) for img in images])
+        results = model.forward(batch)
+
+        for i, (result, target) in enumerate(zip(results, targets)):
+            image_id = f"img_{img_counter}"
+            img_counter += 1
+
+            # --- Predictions ---
+            p_boxes, p_labels, p_scores = [], [], []
+            r_boxes = result.get("boxes")
+            r_labels = result.get("labels")
+            r_scores = result.get("scores")
+            n = len(r_boxes) if r_boxes is not None else 0
+            for j in range(n):
+                score = float(r_scores[j].item() if hasattr(r_scores[j], "item") else r_scores[j])
+                if score < confidence_threshold:
+                    continue
+                box = r_boxes[j].tolist() if hasattr(r_boxes[j], "tolist") else list(r_boxes[j])
+                box = [box[0] / input_size, box[1] / input_size,
+                       box[2] / input_size, box[3] / input_size]
+                lbl = int(r_labels[j].item() if hasattr(r_labels[j], "item") else r_labels[j])
+                if lbl < 0 or lbl >= len(class_names):
+                    continue
+                p_boxes.append(box)
+                p_labels.append(class_names[lbl])
+                p_scores.append(score)
+            predictions.append({
+                "image_id": image_id, "boxes": p_boxes,
+                "labels": p_labels, "scores": p_scores,
+            })
+
+            # --- Ground truths (target boxes are pixel coords at input_size) ---
+            g_boxes, g_labels = [], []
+            t_boxes = target["boxes"]
+            t_labels = target["labels"]
+            for j in range(len(t_boxes)):
+                box = t_boxes[j].tolist()
+                box = [box[0] / input_size, box[1] / input_size,
+                       box[2] / input_size, box[3] / input_size]
+                lbl = int(t_labels[j].item())
+                if lbl < 0 or lbl >= len(class_names):
+                    continue
+                g_boxes.append(box)
+                g_labels.append(class_names[lbl])
+            ground_truths.append({
+                "image_id": image_id, "boxes": g_boxes, "labels": g_labels,
+            })
+
+    return compute_map(
+        predictions=predictions,
+        ground_truths=ground_truths,
+        iou_thresholds=[0.5],
+        class_names=list(class_names),
+    )
+
+
+# -------------------------------------------------------------------------
+# Resume helpers
+# -------------------------------------------------------------------------
+
+
+def _get_model_state_dict(model):
+    """Extract state dict from various model wrapper patterns."""
+    if hasattr(model, "_model") and hasattr(model._model, "model"):
+        return model._model.model.state_dict()
+    elif hasattr(model, "_model"):
+        return model._model.state_dict()
+    elif hasattr(model, "model"):
+        return model.model.state_dict()
+    return model.state_dict()
+
+
+def _set_model_state_dict(model, state_dict):
+    """Load state dict into various model wrapper patterns."""
+    if hasattr(model, "_model") and hasattr(model._model, "model"):
+        model._model.model.load_state_dict(state_dict)
+    elif hasattr(model, "_model"):
+        model._model.load_state_dict(state_dict)
+    elif hasattr(model, "model"):
+        model.model.load_state_dict(state_dict)
+    else:
+        model.load_state_dict(state_dict)
+
+
+def _save_training_state(path, model, optimizer, scheduler, scaler, epoch,
+                         best_val_loss, best_epoch, epochs_without_improvement,
+                         run_id, config_used, best_map=0.0):
+    """Save full training state (model + optimizer + scheduler + metadata) for resume."""
+    state = {
+        "model_state_dict": _get_model_state_dict(model),
+        "optimizer_state_dict": optimizer.state_dict(),
+        "scheduler_state_dict": scheduler.state_dict() if scheduler else None,
+        "scaler_state_dict": scaler.state_dict() if scaler else None,
+        "epoch": epoch,
+        "best_val_loss": best_val_loss,
+        "best_epoch": best_epoch,
+        "epochs_without_improvement": epochs_without_improvement,
+        "best_map": best_map,
+        "run_id": run_id,
+        "config_used": config_used,
+    }
+    torch.save(state, str(path))
+
+
+def _load_training_state(path, model, optimizer, scheduler, scaler, device):
+    """Load training state; restore model/optimizer/scheduler. Returns metadata dict.
+
+    Supports both new-format checkpoints (with optimizer/scheduler/scaler state) and
+    old-format checkpoints (model weights only). When optimizer state is missing,
+    only model weights are loaded and a warning is logged.
+    """
+    state = torch.load(str(path), map_location=device)
+    _set_model_state_dict(model, state["model_state_dict"])
+
+    if "optimizer_state_dict" in state:
+        optimizer.load_state_dict(state["optimizer_state_dict"])
+        if scheduler and state.get("scheduler_state_dict"):
+            scheduler.load_state_dict(state["scheduler_state_dict"])
+        if scaler and state.get("scaler_state_dict"):
+            scaler.load_state_dict(state["scaler_state_dict"])
+    else:
+        logger.warning(
+            "Checkpoint '%s' has no optimizer state (old format). "
+            "Only model weights loaded; optimizer will start fresh.",
+            path,
+        )
+        # Fill in missing metadata with defaults for old-format checkpoints
+        state.setdefault("epoch", -1)
+        state.setdefault("best_val_loss", float("inf"))
+        state.setdefault("best_epoch", 0)
+        state.setdefault("epochs_without_improvement", 0)
+        state.setdefault("run_id", None)
+
+    return state
+
+
+def _resolve_resume_path(resume_from, checkpoint_dir, model_type):
+    """Resolve a --resume argument to an actual .pt file path.
+
+    Supports:
+    - Direct path to a .pt file
+    - Run ID (looks up standard checkpoint locations)
+    """
+    path = Path(resume_from)
+    if path.suffix == ".pt":
+        if path.exists():
+            return path
+        raise FileNotFoundError(f"Resume checkpoint not found: {path}")
+
+    # Treat as run ID: search under <checkpoint_dir>/<run_id>/
+    # (checkpoint_dir already includes the model-type subdirectory)
+    run_dir = Path(checkpoint_dir) / resume_from
+    candidates = [
+        run_dir / "training_state.pt",
+        run_dir / "recovery.pt",
+        run_dir / "final_model.pt",
+        run_dir / "best_model.pt",
+    ]
+    for c in candidates:
+        if c.exists():
+            return c
+
+    searched = "\n  ".join(str(c) for c in candidates)
+    raise FileNotFoundError(
+        f"No checkpoint found for run ID '{resume_from}'.\nSearched:\n  {searched}"
+    )
+
+
+# -------------------------------------------------------------------------
 # Unified training function
 # -------------------------------------------------------------------------
 
 
-def train(config_path: str, verbose: bool = False) -> dict:
+def train(config_path: str, verbose: bool = False, resume_from: Optional[str] = None) -> dict:
     """Run the unified training loop for any registered detection model.
 
     This function provides a single entry point that trains any model type
@@ -426,6 +686,19 @@ def train(config_path: str, verbose: bool = False) -> dict:
     use_amp = training_config.get("use_amp", True)
     num_workers = training_config.get("num_workers", 4)
     early_stopping_patience = training_config.get("early_stopping_patience", 15)
+    resume_from = resume_from or training_config.get("resume_from")
+
+    # --- mAP validation settings (Group A) ---
+    # early_stopping_metric: "loss" (default, legacy) or "map".
+    # When "map", best_model.pt is selected by highest mAP@0.5 and early
+    # stopping monitors mAP. eval_interval controls how often mAP is computed.
+    early_stopping_metric = str(training_config.get("early_stopping_metric", "loss")).lower()
+    eval_interval = int(training_config.get("eval_interval", 5))
+    eval_subset_batches = training_config.get("eval_subset_batches")  # None = full val
+    eval_confidence = float(
+        config.get("evaluation", {}).get("confidence_threshold", 0.25)
+    )
+    use_map_selection = early_stopping_metric == "map"
 
     # Reproducibility seed
     seed = training_config.get("seed", 42)
@@ -489,17 +762,33 @@ def train(config_path: str, verbose: bool = False) -> dict:
     logger.info("Model moved to %s", device)
 
     # Compile model for faster CUDA execution (torch.compile, requires PyTorch 2.0+)
-    if hasattr(torch, "compile") and device.type == "cuda":
+    #
+    # IMPORTANT: Ultralytics-based wrappers (rt_detr, mmr_detr, yolo26) drive
+    # inference through self._model.predict(), which internally references
+    # self._model.model. Wrapping that module in torch.compile() yields an
+    # OptimizedModule that breaks the Ultralytics predict() pipeline, causing
+    # forward()/evaluate_map() to silently return empty detections (mAP=0.0).
+    # We therefore SKIP compilation for these wrappers and only compile plain
+    # nn.Module models that run inference directly through model.forward().
+    is_ultralytics_wrapper = (
+        hasattr(model, "_model")
+        and hasattr(model._model, "predict")
+        and hasattr(model._model, "model")
+    )
+    if hasattr(torch, "compile") and device.type == "cuda" and not is_ultralytics_wrapper:
         try:
-            if hasattr(model, "_model") and hasattr(model._model, "model"):
-                model._model.model = torch.compile(model._model.model, mode="reduce-overhead")
-            elif hasattr(model, "_model"):
+            if hasattr(model, "_model"):
                 model._model = torch.compile(model._model, mode="reduce-overhead")
             elif hasattr(model, "model"):
                 model.model = torch.compile(model.model, mode="reduce-overhead")
             logger.info("Model compiled with torch.compile (mode=reduce-overhead)")
         except Exception as e:
             logger.warning("torch.compile failed, continuing without compilation: %s", e)
+    elif is_ultralytics_wrapper:
+        logger.info(
+            "Skipping torch.compile for Ultralytics-based wrapper "
+            "(compilation breaks predict()/mAP evaluation)"
+        )
 
 
     logger.info("Loading dataset from %s", dataset_path)
@@ -530,16 +819,37 @@ def train(config_path: str, verbose: bool = False) -> dict:
     )
     val_torch = RDD2022TorchDataset(val_ds, input_size=input_size)  # No augmentation for validation
 
+    # Ordered class names for mAP label-index mapping (Group A)
+    class_names_list = train_torch.class_names
+
     # On Windows, DataLoader workers require explicit spawn context
     is_windows = platform.system() == "Windows"
     effective_workers = num_workers
     mp_context = "spawn" if is_windows and effective_workers > 0 else None
 
-    # Create data loaders
+    # --- Class-balanced sampling (Group D) ---
+    # When enabled, oversample images containing rare classes (e.g. pothole)
+    # via WeightedRandomSampler. Default off preserves existing behavior.
+    class_balanced_sampling = bool(training_config.get("class_balanced_sampling", False))
+    train_sampler = None
+    if class_balanced_sampling:
+        sample_weights = train_torch.compute_sample_weights()
+        train_sampler = torch.utils.data.WeightedRandomSampler(
+            weights=torch.as_tensor(sample_weights, dtype=torch.double),
+            num_samples=len(sample_weights),
+            replacement=True,
+        )
+        logger.info(
+            "Class-balanced sampling ENABLED (WeightedRandomSampler over %d images)",
+            len(sample_weights),
+        )
+
+    # Create data loaders. shuffle must be False when a sampler is provided.
     train_loader = torch.utils.data.DataLoader(
         train_torch,
         batch_size=batch_size,
-        shuffle=True,
+        shuffle=(train_sampler is None),
+        sampler=train_sampler,
         num_workers=effective_workers,
         pin_memory=True,
         persistent_workers=effective_workers > 0,
@@ -557,8 +867,30 @@ def train(config_path: str, verbose: bool = False) -> dict:
         collate_fn=collate_fn,
     )
 
-    # --- Construct optimizer from model.get_parameters() ---
-    params = model.get_parameters()
+    # --- Construct optimizer params (discriminative LR if configured) ---
+    # When config provides backbone_lr/head_lr and the model exposes
+    # get_parameter_groups, use discriminative learning rates (Group B).
+    # Otherwise fall back to a flat parameter list (legacy behavior).
+    backbone_lr = training_config.get("backbone_lr")
+    head_lr = training_config.get("head_lr")
+    backbone_layers = int(training_config.get("backbone_layers", 10))
+    if (
+        backbone_lr is not None
+        and head_lr is not None
+        and hasattr(model, "get_parameter_groups")
+    ):
+        params = model.get_parameter_groups(
+            backbone_lr=float(backbone_lr),
+            head_lr=float(head_lr),
+            backbone_layers=backbone_layers,
+        )
+        logger.info(
+            "Using discriminative learning rates (backbone=%.2e, head=%.2e)",
+            float(backbone_lr), float(head_lr),
+        )
+    else:
+        params = model.get_parameters()
+
     if optimizer_name.upper() == "SGD":
         optimizer = torch.optim.SGD(
             params, lr=learning_rate, momentum=momentum, weight_decay=weight_decay
@@ -632,17 +964,6 @@ def train(config_path: str, verbose: bool = False) -> dict:
     tracker = ExperimentTracker(output_dir=checkpoint_dir)
     dataset_name = dataset_config.get("name", Path(dataset_path).name)
 
-    try:
-        run_id = tracker.start_run(config, model_type, dataset_name)
-    except Exception as e:
-        logger.error("Failed to start experiment run: %s", e)
-        signal.signal(signal.SIGINT, original_sigint_handler)
-        return {}
-
-    # Create checkpoint directory for this run
-    run_checkpoint_dir = checkpoint_dir / run_id
-    run_checkpoint_dir.mkdir(parents=True, exist_ok=True)
-
     # --- Determine if save_checkpoint accepts extra params ---
     save_sig = inspect.signature(model.save_checkpoint)
     save_params = list(save_sig.parameters.keys())
@@ -655,18 +976,65 @@ def train(config_path: str, verbose: bool = False) -> dict:
         else:
             model.save_checkpoint(path)
 
+    # --- Resume handling ---
+    start_epoch = 0
+    if resume_from:
+        try:
+            resume_path = _resolve_resume_path(resume_from, checkpoint_dir, model_type)
+            logger.info("Loading resume state from: %s", resume_path)
+            state = _load_training_state(resume_path, model, optimizer, cosine_scheduler, scaler, device)
+            run_id = state.get("run_id")
+            if run_id:
+                # Full training state: resume with same run ID and skip completed epochs
+                start_epoch = state["epoch"] + 1
+                best_val_loss = state["best_val_loss"]
+                best_epoch = state["best_epoch"]
+                epochs_without_improvement = state["epochs_without_improvement"]
+                best_map = state.get("best_map", 0.0)
+                run_checkpoint_dir = Path(checkpoint_dir) / run_id
+                logger.info(
+                    "Resuming run %s from epoch %d (best_val_loss=%.4f at epoch %d)",
+                    run_id, start_epoch, best_val_loss, best_epoch,
+                )
+            else:
+                # Old-format checkpoint (model weights only): start fresh with loaded weights
+                logger.info(
+                    "Old-format checkpoint loaded (model weights only). Starting new training run."
+                )
+                run_id = tracker.start_run(config, model_type, dataset_name)
+                run_checkpoint_dir = checkpoint_dir / run_id
+                run_checkpoint_dir.mkdir(parents=True, exist_ok=True)
+                best_val_loss = float("inf")
+                best_epoch = 0
+                epochs_without_improvement = 0
+                best_map = 0.0
+        except Exception as e:
+            logger.error("Failed to resume from '%s': %s", resume_from, e)
+            signal.signal(signal.SIGINT, original_sigint_handler)
+            return {}
+    else:
+        try:
+            run_id = tracker.start_run(config, model_type, dataset_name)
+        except Exception as e:
+            logger.error("Failed to start experiment run: %s", e)
+            signal.signal(signal.SIGINT, original_sigint_handler)
+            return {}
+        run_checkpoint_dir = checkpoint_dir / run_id
+        run_checkpoint_dir.mkdir(parents=True, exist_ok=True)
+        best_val_loss = float("inf")
+        best_epoch = 0
+        epochs_without_improvement = 0
+        best_map = 0.0
+
     # --- Epoch loop ---
     logger.info("Starting training: %d epochs, batch_size=%d, lr=%.6f", epochs, batch_size, learning_rate)
 
     avg_train_loss = 0.0
     avg_val_loss = float("inf")
-    best_val_loss = float("inf")
-    best_epoch = 0
-    epochs_without_improvement = 0
     completed_epochs = 0
 
     try:
-        for epoch in range(epochs):
+        for epoch in range(start_epoch, epochs):
             epoch_start = time.time()
 
             # --- Mosaic off for final N epochs (fine-tune on clean images) ---
@@ -775,6 +1143,29 @@ def train(config_path: str, verbose: bool = False) -> dict:
 
             avg_val_loss = val_loss_sum / max(val_batches, 1)
 
+            # --- mAP validation (Group A): compute every eval_interval epochs ---
+            current_map = None
+            if use_map_selection and (
+                (epoch + 1) % eval_interval == 0 or epoch == epochs - 1
+            ):
+                try:
+                    eval_max_batches = (
+                        int(eval_subset_batches) if eval_subset_batches else None
+                    )
+                    map_results = evaluate_map(
+                        model, val_loader, class_names_list, input_size, device,
+                        confidence_threshold=eval_confidence,
+                        max_batches=eval_max_batches,
+                    )
+                    current_map = map_results["map_50"]
+                    logger.info(
+                        "Epoch %d: mAP@0.5=%.4f | per-class AP: %s",
+                        epoch + 1, current_map,
+                        {k: round(v, 3) for k, v in map_results["per_class_ap"].items()},
+                    )
+                except Exception as e:
+                    logger.warning("mAP evaluation failed at epoch %d: %s", epoch + 1, e)
+
             epoch_time = time.time() - epoch_start
             completed_epochs = epoch + 1
 
@@ -790,6 +1181,8 @@ def train(config_path: str, verbose: bool = False) -> dict:
                 "learning_rate": current_lr,
                 "epoch_time_s": epoch_time,
             }
+            if current_map is not None:
+                epoch_metrics["map_50"] = current_map
             try:
                 tracker.log_metrics(run_id, step=epoch, metrics=epoch_metrics)
             except Exception as e:
@@ -800,24 +1193,51 @@ def train(config_path: str, verbose: bool = False) -> dict:
                 "train_loss": avg_train_loss,
                 "val_loss": avg_val_loss,
             }
+            if current_map is not None:
+                current_metrics["map_50"] = current_map
 
-            # Best checkpoint: save when val_loss improves
-            if avg_val_loss < best_val_loss:
-                best_val_loss = avg_val_loss
-                best_epoch = epoch + 1  # 1-indexed
-                epochs_without_improvement = 0
-                try:
-                    _save_checkpoint(
-                        run_checkpoint_dir / "best_model.pt",
-                        optimizer_obj=optimizer,
-                        epoch_num=epoch,
-                        metrics_dict=current_metrics,
-                    )
-                    logger.info("Saved best model checkpoint (val_loss=%.4f)", avg_val_loss)
-                except (IOError, OSError) as e:
-                    logger.warning("Failed to save best checkpoint: %s", e)
+            # Best checkpoint selection.
+            # When use_map_selection: select by highest mAP@0.5 (only on epochs
+            # where mAP was computed). Otherwise: legacy val_loss selection.
+            if use_map_selection:
+                if current_map is not None:
+                    if current_map > best_map:
+                        best_map = current_map
+                        best_val_loss = avg_val_loss
+                        best_epoch = epoch + 1
+                        epochs_without_improvement = 0
+                        try:
+                            _save_checkpoint(
+                                run_checkpoint_dir / "best_model.pt",
+                                optimizer_obj=optimizer,
+                                epoch_num=epoch,
+                                metrics_dict=current_metrics,
+                            )
+                            logger.info("Saved best model checkpoint (mAP@0.5=%.4f)", current_map)
+                        except (IOError, OSError) as e:
+                            logger.warning("Failed to save best checkpoint: %s", e)
+                    else:
+                        # Count improvement gaps only on eval epochs
+                        epochs_without_improvement += 1
+                # Non-eval epochs: do not change patience counter
             else:
-                epochs_without_improvement += 1
+                # Legacy: save when val_loss improves
+                if avg_val_loss < best_val_loss:
+                    best_val_loss = avg_val_loss
+                    best_epoch = epoch + 1  # 1-indexed
+                    epochs_without_improvement = 0
+                    try:
+                        _save_checkpoint(
+                            run_checkpoint_dir / "best_model.pt",
+                            optimizer_obj=optimizer,
+                            epoch_num=epoch,
+                            metrics_dict=current_metrics,
+                        )
+                        logger.info("Saved best model checkpoint (val_loss=%.4f)", avg_val_loss)
+                    except (IOError, OSError) as e:
+                        logger.warning("Failed to save best checkpoint: %s", e)
+                else:
+                    epochs_without_improvement += 1
 
             # Recovery checkpoint: every 5 epochs (1-indexed, so epoch+1 % 5 == 0)
             if (epoch + 1) % 5 == 0:
@@ -831,6 +1251,17 @@ def train(config_path: str, verbose: bool = False) -> dict:
                     logger.info("Saved recovery checkpoint at epoch %d", epoch + 1)
                 except (IOError, OSError) as e:
                     logger.warning("Failed to save recovery checkpoint: %s", e)
+
+            # Training state (always, for resume): save every epoch (overwrites previous)
+            try:
+                _save_training_state(
+                    run_checkpoint_dir / "training_state.pt",
+                    model, optimizer, cosine_scheduler, scaler,
+                    epoch, best_val_loss, best_epoch, epochs_without_improvement,
+                    run_id, config, best_map=best_map,
+                )
+            except (IOError, OSError) as e:
+                logger.warning("Failed to save training state at epoch %d: %s", epoch + 1, e)
 
             # --- Early stopping check ---
             if epochs_without_improvement >= early_stopping_patience:
@@ -901,6 +1332,10 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Train detection models on RDD2022")
     parser.add_argument("--config", type=str, required=True, help="Path to training config YAML")
     parser.add_argument("--verbose", "-v", action="store_true", help="Enable debug logging")
+    parser.add_argument(
+        "--resume", type=str, default=None,
+        help="Resume training from a checkpoint. Provide a path to a .pt file or a run ID.",
+    )
     args = parser.parse_args()
 
-    train(args.config, verbose=args.verbose)
+    train(args.config, verbose=args.verbose, resume_from=args.resume)

@@ -14,6 +14,11 @@ python -m model.training.train_detection --config model/configs/train_ssd_mobile
 ## Yolo
 python -m model.training.train_detection --config model/configs/train_yolo26.yaml -v
 
+## Resume training from last checkpoint (by run ID)
+python -m model.training.train_detection --config model/configs/train_rt_detr.yaml --resume dc5722a3-dde9-44dd-b592-12c52590d68c -v
+
+## Resume training from a specific .pt file
+python -m model.training.train_detection --config model/configs/train_rt_detr.yaml --resume checkpoints/rt_detr/dc5722a3-dde9-44dd-b592-12c52590d68c/training_state.pt -v
 
 ### Convert data
 python -m model.scripts.convert_supervisely_to_yolo --src model/data/rdd2022/sample --dst model/data/rdd2022/sample_yolo

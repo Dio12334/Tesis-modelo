@@ -54,15 +54,16 @@ class SSDMobileNetV3(BaseDetector):
         # Build the actual torchvision SSD model
         # num_classes + 1 for background class (torchvision convention)
         self._model = self._build_model()
-        self._device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        self._model.to(self._device)
 
         logger.info(
-            "Initialized SSD MobileNetV3 (input_size=%d, num_classes=%d, device=%s)",
+            "Initialized SSD MobileNetV3 (input_size=%d, num_classes=%d)",
             self.input_size,
             self.num_classes,
-            self._device,
         )
+
+    @property
+    def _device(self) -> torch.device:
+        return next(self._model.parameters()).device
 
     def _build_model(self) -> nn.Module:
         """Build the SSD MobileNetV3 model from torchvision.
@@ -119,19 +120,10 @@ class SSDMobileNetV3(BaseDetector):
         with torch.no_grad():
             outputs = self._model(image_list)
 
-        # Normalize box coordinates to [0, 1] if needed
         results = []
-        for i, output in enumerate(outputs):
-            h, w = images.shape[2], images.shape[3]
-            boxes = output["boxes"]
-            if boxes.numel() > 0:
-                # Normalize to [0, 1]
-                boxes[:, [0, 2]] /= w
-                boxes[:, [1, 3]] /= h
-
+        for output in outputs:
             results.append({
-                "boxes": boxes,
-                
+                "boxes": output["boxes"],
                 "labels": output["labels"],
                 "scores": output["scores"],
             })

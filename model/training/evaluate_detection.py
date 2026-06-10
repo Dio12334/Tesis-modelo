@@ -309,7 +309,16 @@ def resolve_checkpoint(config: dict) -> Path:
         checkpoint_dir = "./checkpoints"
 
     run_dir = Path(checkpoint_dir) / str(model_type) / str(run_id)
-    candidates = [run_dir / "best_model.pt", run_dir / "last_model.pt"]
+    # Search order: best_model.pt (mAP/loss best) -> last_model.pt -> final_model.pt
+    # (saved at end of training) -> recovery.pt (periodic). final/recovery cover
+    # runs that stopped before any best_model.pt was written (e.g. mAP-based
+    # selection where mAP had not improved yet).
+    candidates = [
+        run_dir / "best_model.pt",
+        run_dir / "last_model.pt",
+        run_dir / "final_model.pt",
+        run_dir / "recovery.pt",
+    ]
 
     for candidate in candidates:
         if candidate.exists():

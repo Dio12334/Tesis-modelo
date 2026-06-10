@@ -4,12 +4,219 @@ Provides subcommands for training, evaluation, inference, and model listing.
 """
 
 import argparse
+import json
 import logging
 import sys
 from pathlib import Path
-from typing import List, Optional
+from typing import List, Optional, Tuple
 
 logger = logging.getLogger(__name__)
+
+# Checkpoint filenames tried in order of preference for inference
+_INFER_CHECKPOINT_PREFERENCE = ["best_model.pt", "final_model.pt", "recovery.pt"]
+_DEFAULT_CHECKPOINT_BASE = Path("checkpoints")
+
+
+def _infer_model_type_from_path(checkpoint_path: Path, checkpoint_base_dir: Path) -> Optional[str]:
+    """Return the model-type directory name if *checkpoint_path* lives under
+    ``<checkpoint_base_dir>/<model_type>/…``, otherwise return None."""
+    try:
+        rel = checkpoint_path.resolve().relative_to(checkpoint_base_dir.resolve())
+        if rel.parts:
+            return rel.parts[0]
+    except ValueError:
+        pass
+    return None
+
+
+def _find_by_run_id(run_id: str, checkpoint_base_dir: Path) -> Tuple[Path, str]:
+    """Locate the best available checkpoint for *run_id*.
+
+    Searches ``<checkpoint_base_dir>/<model_type>/<run_id>.json`` across all
+    model-type subdirectories.  Returns ``(checkpoint_path, model_type)``.
+    """
+    if not checkpoint_base_dir.exists():
+        raise FileNotFoundError(f"Checkpoint directory not found: {checkpoint_base_dir}")
+
+    for model_dir in sorted(checkpoint_base_dir.iterdir()):
+        if not model_dir.is_dir():
+            continue
+        json_path = model_dir / f"{run_id}.json"
+        if not json_path.exists():
+            continue
+        with json_path.open() as fh:
+            metadata = json.load(fh)
+        model_type = metadata.get("model_name")
+        if not model_type:
+            raise ValueError(
+                f"Run metadata at {json_path} is missing the 'model_name' field."
+            )
+        run_dir = model_dir / run_id
+        if not run_dir.is_dir():
+            raise FileNotFoundError(f"Run directory not found: {run_dir}")
+        for filename in _INFER_CHECKPOINT_PREFERENCE:
+            pt_path = run_dir / filename
+            if pt_path.exists():
+                return pt_path, model_type
+        raise FileNotFoundError(
+            f"No .pt checkpoint file found in {run_dir}. "
+            f"Looked for: {_INFER_CHECKPOINT_PREFERENCE}"
+        )
+
+    raise FileNotFoundError(
+        f"No run found with ID '{run_id}' under {checkpoint_base_dir}"
+    )
+
+
+def _find_last_checkpoint(
+    model_type_filter: Optional[str], checkpoint_base_dir: Path
+) -> Tuple[Path, str]:
+    """Find the most recently completed run's checkpoint.
+
+    Scans all ``<run_id>.json`` metadata files and sorts by ``end_time``
+    (ISO-8601 strings sort lexicographically).  Falls back to file mtime.
+    Returns ``(checkpoint_path, model_type)``.
+    """
+    if not checkpoint_base_dir.exists():
+        raise FileNotFoundError(f"Checkpoint directory not found: {checkpoint_base_dir}")
+
+    candidates = []
+    for model_dir in sorted(checkpoint_base_dir.iterdir()):
+        if not model_dir.is_dir():
+            continue
+        if model_type_filter and model_dir.name != model_type_filter:
+            continue
+        for json_path in model_dir.glob("*.json"):
+            try:
+                with json_path.open() as fh:
+                    metadata = json.load(fh)
+                end_time = metadata.get("end_time", "")
+                model_name = metadata.get("model_name", model_dir.name)
+                run_id = metadata.get("run_id", json_path.stem)
+                candidates.append(
+                    (end_time, json_path.stat().st_mtime, run_id, model_name, model_dir)
+                )
+            except (json.JSONDecodeError, OSError):
+                continue
+
+    if not candidates:
+        scope = f" for model type '{model_type_filter}'" if model_type_filter else ""
+        raise FileNotFoundError(
+            f"No completed checkpoints found{scope} under {checkpoint_base_dir}"
+        )
+
+    # Primary sort: end_time string (ISO-8601 lex order, None sorts last); secondary: file mtime
+    candidates.sort(key=lambda x: (x[0] or "", x[1]), reverse=True)
+    _, _, run_id, model_name, model_dir = candidates[0]
+
+    run_dir = model_dir / run_id
+    if not run_dir.is_dir():
+        raise FileNotFoundError(f"Run directory not found: {run_dir}")
+
+    for filename in _INFER_CHECKPOINT_PREFERENCE:
+        pt_path = run_dir / filename
+        if pt_path.exists():
+            return pt_path, model_name
+
+    raise FileNotFoundError(
+        f"No .pt checkpoint file found in {run_dir}. "
+        f"Looked for: {_INFER_CHECKPOINT_PREFERENCE}"
+    )
+
+
+def _resolve_checkpoint_and_model_type(
+    args: argparse.Namespace,
+    checkpoint_base_dir: Path = _DEFAULT_CHECKPOINT_BASE,
+) -> Tuple[Path, str]:
+    """Resolve checkpoint path and model type from parsed CLI args.
+
+    Exactly one of ``--checkpoint``, ``--run-id``, or ``--last`` must be set.
+    Returns ``(checkpoint_path, model_type)``.
+    """
+    has_checkpoint = bool(getattr(args, "checkpoint", None))
+    has_run_id = bool(getattr(args, "run_id", None))
+    has_last = bool(getattr(args, "last", False))
+    model_type_arg: Optional[str] = getattr(args, "model_type", None)
+
+    specified = sum([has_checkpoint, has_run_id, has_last])
+    if specified == 0:
+        raise ValueError(
+            "Must specify one of --checkpoint <path>, --run-id <id>, or --last."
+        )
+    if specified > 1:
+        raise ValueError(
+            "Only one of --checkpoint, --run-id, or --last may be specified at a time."
+        )
+
+    if has_last:
+        checkpoint_path, model_type = _find_last_checkpoint(model_type_arg, checkpoint_base_dir)
+        logger.info(
+            "Using last checkpoint: %s (model: %s)", checkpoint_path, model_type
+        )
+        return checkpoint_path, model_type
+
+    if has_run_id:
+        checkpoint_path, model_type = _find_by_run_id(args.run_id, checkpoint_base_dir)
+        logger.info(
+            "Using checkpoint for run %s: %s (model: %s)",
+            args.run_id,
+            checkpoint_path,
+            model_type,
+        )
+        return checkpoint_path, model_type
+
+    # --checkpoint explicit path
+    checkpoint_path = Path(args.checkpoint)
+    if model_type_arg:
+        model_type = model_type_arg
+    else:
+        model_type = _infer_model_type_from_path(checkpoint_path, checkpoint_base_dir)
+        if not model_type:
+            raise ValueError(
+                f"Cannot determine model type from path: {checkpoint_path}\n"
+                "The path does not match the expected structure "
+                "<checkpoint_base>/<model_type>/...  "
+                "Use --model-type <name> to specify it explicitly."
+            )
+    return checkpoint_path, model_type
+
+
+def _add_checkpoint_args(parser: argparse.ArgumentParser) -> None:
+    """Add mutually-exclusive checkpoint selection arguments to *parser*."""
+    group = parser.add_mutually_exclusive_group()
+    group.add_argument(
+        "--checkpoint",
+        type=str,
+        default=None,
+        metavar="PATH",
+        help="Path to a .pt checkpoint file.",
+    )
+    group.add_argument(
+        "--run-id",
+        type=str,
+        dest="run_id",
+        default=None,
+        metavar="UUID",
+        help="Run ID; auto-detects model type and picks the best available .pt file.",
+    )
+    group.add_argument(
+        "--last",
+        action="store_true",
+        default=False,
+        help="Use the most recently completed checkpoint.",
+    )
+    parser.add_argument(
+        "--model-type",
+        type=str,
+        dest="model_type",
+        default=None,
+        metavar="NAME",
+        help=(
+            "Model type name (e.g. rt_detr, yolo26).  "
+            "Required with --checkpoint when the path is outside the standard "
+            "checkpoint directory.  Optionally scopes --last to one model type."
+        ),
+    )
 
 
 def create_parser() -> argparse.ArgumentParser:
@@ -42,18 +249,19 @@ def create_parser() -> argparse.ArgumentParser:
         required=True,
         help="Path to the training configuration YAML file.",
     )
+    train_parser.add_argument(
+        "--resume",
+        type=str,
+        default=None,
+        help="Resume training from a checkpoint. Provide a path to a .pt file or a run ID.",
+    )
 
     # evaluate subcommand
     eval_parser = subparsers.add_parser(
         "evaluate",
         help="Evaluate a trained model on a dataset.",
     )
-    eval_parser.add_argument(
-        "--checkpoint",
-        type=str,
-        required=True,
-        help="Path to the model checkpoint file.",
-    )
+    _add_checkpoint_args(eval_parser)
     eval_parser.add_argument(
         "--dataset",
         type=str,
@@ -66,12 +274,7 @@ def create_parser() -> argparse.ArgumentParser:
         "predict",
         help="Run inference on images using a trained model.",
     )
-    predict_parser.add_argument(
-        "--checkpoint",
-        type=str,
-        required=True,
-        help="Path to the model checkpoint file.",
-    )
+    _add_checkpoint_args(predict_parser)
     predict_parser.add_argument(
         "--input",
         type=str,
@@ -108,14 +311,18 @@ def handle_train(args: argparse.Namespace) -> None:
 
     config_path = args.config
     verbose = getattr(args, "verbose", False)
+    resume_from = getattr(args, "resume", None)
 
     logger.info("Starting real PyTorch training with config: %s", config_path)
-    results = train(config_path=config_path, verbose=verbose)
+    results = train(config_path=config_path, verbose=verbose, resume_from=resume_from)
+
+    def _fmt(val):
+        return f"{val:.4f}" if isinstance(val, (int, float)) else str(val)
 
     print(f"\nTraining complete.")
-    print(f"  Final train loss: {results.get('final_train_loss', 'N/A'):.4f}")
-    print(f"  Final val loss:   {results.get('final_val_loss', 'N/A'):.4f}")
-    print(f"  Best val loss:    {results.get('best_val_loss', 'N/A'):.4f}")
+    print(f"  Final train loss: {_fmt(results.get('final_train_loss', 'N/A'))}")
+    print(f"  Final val loss:   {_fmt(results.get('final_val_loss', 'N/A'))}")
+    print(f"  Best val loss:    {_fmt(results.get('best_val_loss', 'N/A'))}")
     print(f"  Best epoch:       {results.get('best_epoch', 'N/A')}")
     print(f"  Total epochs:     {results.get('total_epochs', 'N/A')}")
     if "run_id" in results:
@@ -131,12 +338,13 @@ def handle_evaluate(args: argparse.Namespace) -> None:
     Args:
         args: Parsed command-line arguments.
     """
+    import model.models  # noqa: F401 — registers all model wrappers
     from model.datasets.rdd2022 import RDD2022Dataset
     from model.evaluation.engine import EvaluationEngine
     from model.models.registry import ModelRegistry
     from model.tracking.tracker import ExperimentTracker
 
-    checkpoint_path = Path(args.checkpoint)
+    checkpoint_path, model_type = _resolve_checkpoint_and_model_type(args)
     dataset_path = Path(args.dataset)
 
     if not checkpoint_path.exists():
@@ -151,16 +359,7 @@ def handle_evaluate(args: argparse.Namespace) -> None:
     dataset = RDD2022Dataset()
     dataset.load(dataset_path)
 
-    # Determine model type from checkpoint metadata or use first registered model
-    # For now, we attempt to load checkpoint info
     logger.info("Loading model checkpoint from %s", checkpoint_path)
-    available_models = ModelRegistry.list_models()
-    if not available_models:
-        print("Error: No models registered.", file=sys.stderr)
-        sys.exit(1)
-
-    # Use the first available model as default (user should specify in config)
-    model_type = available_models[0]
     model = ModelRegistry.create(model_type, {})
     model.load_checkpoint(checkpoint_path)
 
@@ -208,10 +407,11 @@ def handle_predict(args: argparse.Namespace) -> None:
     Args:
         args: Parsed command-line arguments.
     """
+    import model.models  # noqa: F401 — registers all model wrappers
     from model.inference.pipeline import InferencePipeline
     from model.models.registry import ModelRegistry
 
-    checkpoint_path = Path(args.checkpoint)
+    checkpoint_path, model_type = _resolve_checkpoint_and_model_type(args)
     input_path = Path(args.input)
     output_path = Path(args.output)
 
@@ -225,12 +425,6 @@ def handle_predict(args: argparse.Namespace) -> None:
 
     # Load model
     logger.info("Loading model checkpoint from %s", checkpoint_path)
-    available_models = ModelRegistry.list_models()
-    if not available_models:
-        print("Error: No models registered.", file=sys.stderr)
-        sys.exit(1)
-
-    model_type = available_models[0]
     model = ModelRegistry.create(model_type, {})
     model.load_checkpoint(checkpoint_path)
 

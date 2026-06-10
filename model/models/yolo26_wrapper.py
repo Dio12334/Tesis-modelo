@@ -665,9 +665,9 @@ class YOLO26Detector(BaseDetector):
 
             if boxes is None or len(boxes) == 0:
                 predictions.append({
-                    "boxes": torch.zeros((0, 4), device=device),
+                    "boxes": torch.zeros((0, 4), dtype=torch.float32, device=device),
                     "labels": torch.zeros((0,), dtype=torch.int64, device=device),
-                    "scores": torch.zeros((0,), device=device),
+                    "scores": torch.zeros((0,), dtype=torch.float32, device=device),
                 })
                 continue
 
@@ -683,9 +683,9 @@ class YOLO26Detector(BaseDetector):
 
             if xyxy.shape[0] == 0:
                 predictions.append({
-                    "boxes": torch.zeros((0, 4), device=device),
+                    "boxes": torch.zeros((0, 4), dtype=torch.float32, device=device),
                     "labels": torch.zeros((0,), dtype=torch.int64, device=device),
-                    "scores": torch.zeros((0,), device=device),
+                    "scores": torch.zeros((0,), dtype=torch.float32, device=device),
                 })
             else:
                 predictions.append({
