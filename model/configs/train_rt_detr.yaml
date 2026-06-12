@@ -8,11 +8,11 @@ model:
     num_classes: 5
     confidence_threshold: 0.25
     iou_threshold: 0.7
-    freeze_layers: 26  # Number of initial layers to freeze (0 to total_layers). Optional.
+    freeze_layers: 19  # Number of initial layers to freeze (0 to total_layers). Optional.
 
 dataset:
   type: rdd2022
-  path: model/data/rdd2022/complete
+  path: model/data/rdd2022/
   class_mapping: model/configs/rdd2022_classes.yaml
 
 training:
