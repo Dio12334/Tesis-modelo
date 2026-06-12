@@ -13,6 +13,7 @@ import argparse
 import inspect
 import logging
 import math
+import platform
 import random
 import signal
 import sys
@@ -371,11 +372,120 @@ def collate_fn(batch):
 
 
 # -------------------------------------------------------------------------
+# Resume helpers
+# -------------------------------------------------------------------------
+
+
+def _get_model_state_dict(model):
+    """Extract state dict from various model wrapper patterns."""
+    if hasattr(model, "_model") and hasattr(model._model, "model"):
+        return model._model.model.state_dict()
+    elif hasattr(model, "_model"):
+        return model._model.state_dict()
+    elif hasattr(model, "model"):
+        return model.model.state_dict()
+    return model.state_dict()
+
+
+def _set_model_state_dict(model, state_dict):
+    """Load state dict into various model wrapper patterns."""
+    if hasattr(model, "_model") and hasattr(model._model, "model"):
+        model._model.model.load_state_dict(state_dict)
+    elif hasattr(model, "_model"):
+        model._model.load_state_dict(state_dict)
+    elif hasattr(model, "model"):
+        model.model.load_state_dict(state_dict)
+    else:
+        model.load_state_dict(state_dict)
+
+
+def _save_training_state(path, model, optimizer, scheduler, scaler, epoch,
+                         best_val_loss, best_epoch, epochs_without_improvement,
+                         run_id, config_used):
+    """Save full training state (model + optimizer + scheduler + metadata) for resume."""
+    state = {
+        "model_state_dict": _get_model_state_dict(model),
+        "optimizer_state_dict": optimizer.state_dict(),
+        "scheduler_state_dict": scheduler.state_dict() if scheduler else None,
+        "scaler_state_dict": scaler.state_dict() if scaler else None,
+        "epoch": epoch,
+        "best_val_loss": best_val_loss,
+        "best_epoch": best_epoch,
+        "epochs_without_improvement": epochs_without_improvement,
+        "run_id": run_id,
+        "config_used": config_used,
+    }
+    torch.save(state, str(path))
+
+
+def _load_training_state(path, model, optimizer, scheduler, scaler, device):
+    """Load training state; restore model/optimizer/scheduler. Returns metadata dict.
+
+    Supports both new-format checkpoints (with optimizer/scheduler/scaler state) and
+    old-format checkpoints (model weights only). When optimizer state is missing,
+    only model weights are loaded and a warning is logged.
+    """
+    state = torch.load(str(path), map_location=device)
+    _set_model_state_dict(model, state["model_state_dict"])
+
+    if "optimizer_state_dict" in state:
+        optimizer.load_state_dict(state["optimizer_state_dict"])
+        if scheduler and state.get("scheduler_state_dict"):
+            scheduler.load_state_dict(state["scheduler_state_dict"])
+        if scaler and state.get("scaler_state_dict"):
+            scaler.load_state_dict(state["scaler_state_dict"])
+    else:
+        logger.warning(
+            "Checkpoint '%s' has no optimizer state (old format). "
+            "Only model weights loaded; optimizer will start fresh.",
+            path,
+        )
+        state.setdefault("epoch", -1)
+        state.setdefault("best_val_loss", float("inf"))
+        state.setdefault("best_epoch", 0)
+        state.setdefault("epochs_without_improvement", 0)
+        state.setdefault("run_id", None)
+
+    return state
+
+
+def _resolve_resume_path(resume_from, checkpoint_dir, model_type):
+    """Resolve a --resume argument to an actual .pt file path.
+
+    Supports:
+    - Direct path to a .pt file
+    - Run ID (looks up standard checkpoint locations)
+    """
+    path = Path(resume_from)
+    if path.suffix == ".pt":
+        if path.exists():
+            return path
+        raise FileNotFoundError(f"Resume checkpoint not found: {path}")
+
+    # Treat as run ID: search under <checkpoint_dir>/<run_id>/
+    run_dir = Path(checkpoint_dir) / resume_from
+    candidates = [
+        run_dir / "training_state.pt",
+        run_dir / "recovery.pt",
+        run_dir / "final_model.pt",
+        run_dir / "best_model.pt",
+    ]
+    for c in candidates:
+        if c.exists():
+            return c
+
+    searched = "\n  ".join(str(c) for c in candidates)
+    raise FileNotFoundError(
+        f"No checkpoint found for run ID '{resume_from}'.\nSearched:\n  {searched}"
+    )
+
+
+# -------------------------------------------------------------------------
 # Unified training function
 # -------------------------------------------------------------------------
 
 
-def train(config_path: str, verbose: bool = False) -> dict:
+def train(config_path: str, verbose: bool = False, resume_from: Optional[str] = None) -> dict:
     """Run the unified training loop for any registered detection model.
 
     This function provides a single entry point that trains any model type
@@ -385,6 +495,7 @@ def train(config_path: str, verbose: bool = False) -> dict:
     Args:
         config_path: Path to the YAML training configuration.
         verbose: Enable debug logging.
+        resume_from: Run ID or path to a .pt checkpoint to resume from.
 
     Returns:
         Dict with final training metrics.
@@ -422,6 +533,7 @@ def train(config_path: str, verbose: bool = False) -> dict:
     warmup_epochs = training_config.get("warmup_epochs", 3)
     val_split = training_config.get("val_split", 0.2)
     checkpoint_dir = Path(training_config.get("checkpoint_dir", "./checkpoints"))
+    resume_from = resume_from or training_config.get("resume_from")
     log_interval = training_config.get("log_interval", 10)
     use_amp = training_config.get("use_amp", True)
     num_workers = training_config.get("num_workers", 4)
@@ -632,17 +744,6 @@ def train(config_path: str, verbose: bool = False) -> dict:
     tracker = ExperimentTracker(output_dir=checkpoint_dir)
     dataset_name = dataset_config.get("name", Path(dataset_path).name)
 
-    try:
-        run_id = tracker.start_run(config, model_type, dataset_name)
-    except Exception as e:
-        logger.error("Failed to start experiment run: %s", e)
-        signal.signal(signal.SIGINT, original_sigint_handler)
-        return {}
-
-    # Create checkpoint directory for this run
-    run_checkpoint_dir = checkpoint_dir / run_id
-    run_checkpoint_dir.mkdir(parents=True, exist_ok=True)
-
     # --- Determine if save_checkpoint accepts extra params ---
     save_sig = inspect.signature(model.save_checkpoint)
     save_params = list(save_sig.parameters.keys())
@@ -655,18 +756,56 @@ def train(config_path: str, verbose: bool = False) -> dict:
         else:
             model.save_checkpoint(path)
 
+    # --- Resume handling ---
+    start_epoch = 0
+    best_val_loss = float("inf")
+    best_epoch = 0
+    epochs_without_improvement = 0
+
+    if resume_from:
+        try:
+            resume_path = _resolve_resume_path(resume_from, checkpoint_dir, model_type)
+            logger.info("Loading resume state from: %s", resume_path)
+            state = _load_training_state(resume_path, model, optimizer, cosine_scheduler, scaler, device)
+            run_id = state.get("run_id")
+            if run_id:
+                start_epoch = state["epoch"] + 1
+                best_val_loss = state["best_val_loss"]
+                best_epoch = state["best_epoch"]
+                epochs_without_improvement = state["epochs_without_improvement"]
+                run_checkpoint_dir = Path(checkpoint_dir) / run_id
+                logger.info(
+                    "Resuming run %s from epoch %d (best_val_loss=%.4f at epoch %d)",
+                    run_id, start_epoch, best_val_loss, best_epoch,
+                )
+            else:
+                logger.info("Old-format checkpoint loaded. Starting new training run.")
+                run_id = tracker.start_run(config, model_type, dataset_name)
+                run_checkpoint_dir = checkpoint_dir / run_id
+                run_checkpoint_dir.mkdir(parents=True, exist_ok=True)
+        except Exception as e:
+            logger.error("Failed to resume from '%s': %s", resume_from, e)
+            signal.signal(signal.SIGINT, original_sigint_handler)
+            return {}
+    else:
+        try:
+            run_id = tracker.start_run(config, model_type, dataset_name)
+        except Exception as e:
+            logger.error("Failed to start experiment run: %s", e)
+            signal.signal(signal.SIGINT, original_sigint_handler)
+            return {}
+        run_checkpoint_dir = checkpoint_dir / run_id
+        run_checkpoint_dir.mkdir(parents=True, exist_ok=True)
+
     # --- Epoch loop ---
     logger.info("Starting training: %d epochs, batch_size=%d, lr=%.6f", epochs, batch_size, learning_rate)
 
     avg_train_loss = 0.0
     avg_val_loss = float("inf")
-    best_val_loss = float("inf")
-    best_epoch = 0
-    epochs_without_improvement = 0
     completed_epochs = 0
 
     try:
-        for epoch in range(epochs):
+        for epoch in range(start_epoch, epochs):
             epoch_start = time.time()
 
             # --- Mosaic off for final N epochs (fine-tune on clean images) ---
@@ -832,6 +971,17 @@ def train(config_path: str, verbose: bool = False) -> dict:
                 except (IOError, OSError) as e:
                     logger.warning("Failed to save recovery checkpoint: %s", e)
 
+            # Training state (always, for resume): overwritten each epoch
+            try:
+                _save_training_state(
+                    run_checkpoint_dir / "training_state.pt",
+                    model, optimizer, cosine_scheduler, scaler,
+                    epoch, best_val_loss, best_epoch, epochs_without_improvement,
+                    run_id, config,
+                )
+            except (IOError, OSError) as e:
+                logger.warning("Failed to save training state: %s", e)
+
             # --- Early stopping check ---
             if epochs_without_improvement >= early_stopping_patience:
                 logger.info(
@@ -901,6 +1051,8 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Train detection models on RDD2022")
     parser.add_argument("--config", type=str, required=True, help="Path to training config YAML")
     parser.add_argument("--verbose", "-v", action="store_true", help="Enable debug logging")
+    parser.add_argument("--resume", type=str, default=None,
+                        help="Run ID or path to .pt checkpoint to resume from")
     args = parser.parse_args()
 
-    train(args.config, verbose=args.verbose)
+    train(args.config, verbose=args.verbose, resume_from=args.resume)
