@@ -272,11 +272,12 @@ def resolve_checkpoint(config: dict) -> Path:
     * When ``checkpoint.path`` is present and non-null, that value is returned
       verbatim as a :class:`~pathlib.Path` without probing the filesystem; any
       existence/openability check is deferred to the loading stage (Req 5.1).
-    * Otherwise, when ``checkpoint.run_id`` is present, two candidate paths are
+    * Otherwise, when ``checkpoint.run_id`` is present, candidate paths are
       built under ``<checkpoint_dir>/<model.type>/<run_id>/`` in search order --
-      ``best_model.pt`` first, then ``last_model.pt`` -- and the first candidate
-      that exists on disk is returned (Req 5.2, 5.3). ``checkpoint.checkpoint_dir``
-      defaults to ``./checkpoints`` when absent.
+      ``best_model.pt``, ``last_model.pt``, ``final_model.pt``,
+      ``training_state.pt`` -- and the first candidate that exists on disk is
+      returned (Req 5.2, 5.3). ``checkpoint.checkpoint_dir`` defaults to
+      ``./checkpoints`` when absent.
 
     When ``checkpoint.run_id`` is used and neither candidate exists, a
     :class:`FileNotFoundError` is raised whose message lists every searched path
@@ -319,7 +320,12 @@ def resolve_checkpoint(config: dict) -> Path:
         checkpoint_dir = "./checkpoints"
 
     run_dir = Path(checkpoint_dir) / str(model_type) / str(run_id)
-    candidates = [run_dir / "best_model.pt", run_dir / "last_model.pt"]
+    candidates = [
+        run_dir / "best_model.pt",
+        run_dir / "last_model.pt",
+        run_dir / "final_model.pt",
+        run_dir / "training_state.pt",
+    ]
 
     for candidate in candidates:
         if candidate.exists():

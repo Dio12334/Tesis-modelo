@@ -1,0 +1,74 @@
+name: rdd2022_mmr_detr
+
+model:
+  type: mmr_detr
+  config:
+    model_yaml: model/configs/models/mmr_detr.yaml
+    pretrained_weights: model/configs/models/RDD2022-MMR-DETR_best.pt
+    input_size: 640
+    num_classes: 5
+    confidence_threshold: 0.25
+    iou_threshold: 0.5
+    # freeze_layers removed: replaced by discriminative LR (backbone_lr/head_lr)
+
+dataset:
+  type: rdd2022
+  path: model/data/rdd2022/
+  class_mapping: model/configs/rdd2022_classes.yaml
+
+training:
+  epochs: 100
+  early_stopping_patience: 30          # patience over mAP (eval epochs)
+  batch_size: 16
+  num_workers: 4
+  use_amp: true
+  learning_rate: 0.0001                # base LR (used if discriminative off)
+  optimizer: AdamW
+  weight_decay: 0.0001
+  momentum: 0.937
+  scheduler: cosine
+  warmup_epochs: 5
+  val_split: 0.2
+  checkpoint_dir: ./checkpoints/mmr_detr
+  log_interval: 10
+  seed: 42
+
+  # --- Group A: mAP-based selection ---
+  early_stopping_metric: map           # select best_model.pt by mAP@0.5
+  eval_interval: 5                     # compute mAP every 5 epochs
+
+  # --- Group B: discriminative learning rates ---
+  backbone_lr: 0.00001                 # low LR preserves pretrained backbone
+  head_lr: 0.0001                      # normal LR for encoder/decoder/heads
+  backbone_layers: 10                  # first 10 layers treated as backbone
+
+  # --- Group D: class-balanced sampling (oversample pothole) ---
+  class_balanced_sampling: true
+
+  loss:
+    label_smoothing: 0.01
+    focal_loss: true
+    focal_gamma: 1.5
+    focal_alpha: 0.25
+
+  # --- Group C: stronger augmentation ---
+  augmentation:
+    mosaic: 0.5                        # enabled (was 0 -> mixup never fired)
+    mixup: 0.1                         # now independent of mosaic
+    mosaic_off_epochs: 10              # clean fine-tune for final 10 epochs
+    horizontal_flip: true
+    vertical_flip: false
+    hsv_h: 0.015
+    hsv_s: 0.5
+    hsv_v: 0.4
+    scale: [0.5, 1.5]                  # wider scale for multi-scale potholes
+    translate: 0.1
+
+evaluation:
+  iou_thresholds: [0.25, 0.5, 0.75]
+  confidence_threshold: 0.25
+
+output:
+  checkpoint_dir: ./checkpoints/mmr_detr
+  results_dir: ./results/mmr_detr
+  log_dir: ./logs/mmr_detr
