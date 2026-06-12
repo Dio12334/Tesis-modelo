@@ -173,6 +173,7 @@ class TestEvalIntegration:
                 "split": split,
                 "confidence_threshold": 0.25,
                 "iou_threshold": 0.5,
+                "confidence_thresholds_sweep": [0.05, 0.25, 0.50],
                 "output_dir": str(output_dir),
                 "val_split": 0.2,
                 "seed": 42,

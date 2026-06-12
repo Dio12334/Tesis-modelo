@@ -31,7 +31,10 @@ from model.datasets.rdd2022 import RDD2022Dataset
 from model.evaluation.metrics import (
     compute_confusion_matrix,
     compute_map,
+    compute_per_class_f1_sweep,
     compute_precision_recall_f1,
+    compute_precision_recall_f1_sweep,
+    find_best_f1,
 )
 from model.exceptions import (
     ConfigurationError,
@@ -43,6 +46,13 @@ from model.exceptions import (
 from model.models.registry import BaseDetector, ModelRegistry
 
 logger = logging.getLogger(__name__)
+
+
+# Phase-2 evaluation architecture: detector inference is always invoked with a
+# fixed low confidence floor so the F1 sweep can reconstruct the full PR
+# curve. The evaluation-time ``confidence_threshold`` is reserved for the
+# default P/R/F1 entry and the confusion matrix only.
+_INFERENCE_CONFIDENCE_FLOOR = 0.001
 
 
 def load_and_merge_config(
@@ -1155,6 +1165,7 @@ def compute_all_metrics(
     confidence_threshold: float,
     iou_threshold: float,
     errors: Optional[List[str]] = None,
+    confidence_thresholds_sweep: Optional[List[float]] = None,
 ) -> dict:
     """Compute the full detection metric suite for an evaluation run.
 
@@ -1167,9 +1178,30 @@ def compute_all_metrics(
       class name (Req 8.1, 8.4).
     * :func:`compute_precision_recall_f1` yields overall ``precision``,
       ``recall``, and ``f1`` (surfaced here as ``f1_score``) at the configured
-      ``confidence_threshold`` / ``iou_threshold`` (Req 8.2).
+      ``confidence_threshold`` / ``iou_threshold`` (Req 8.2). This entry is the
+      single deployment-default operating point and is the value referenced by
+      the report's top-level ``confidence_threshold`` field.
     * :func:`compute_confusion_matrix` yields a ``(C, C)`` confusion matrix over
       ``class_names`` at the same thresholds (Req 8.3).
+
+    Confidence sweep (Phase-2 evaluation architecture): when
+    ``confidence_thresholds_sweep`` is supplied, the metrics dict additionally
+    carries four sweep fields used by the downstream report and comparison
+    tooling:
+
+    * ``f1_sweep``: list of ``{confidence, precision, recall, f1}`` entries, one
+      per sweep threshold, sorted ascending by confidence.
+    * ``best_f1``: the sweep entry with the highest F1 (ties broken by higher
+      confidence).
+    * ``per_class_best_f1``: dict ``{class_name: {confidence, precision,
+      recall, f1}}`` giving the per-class best operating point.
+    * ``default_confidence_threshold``: echoes ``confidence_threshold`` so the
+      report explicitly records which operating point produced the default
+      P/R/F1 numbers.
+
+    When ``confidence_thresholds_sweep`` is ``None`` (legacy callers), the four
+    sweep fields are omitted from the returned dict to preserve the prior
+    contract.
 
     Req 8.5: when **any** image in the run has an empty prediction entry (no
     boxes, labels, or scores), the scalar metrics ``map_50``, ``map_50_95``,
@@ -1184,14 +1216,22 @@ def compute_all_metrics(
         ground_truths: The aligned per-image ground-truth entries.
         class_names: Ordered class names defining the confusion-matrix axes and
             the per-class-AP keys.
-        confidence_threshold: Minimum confidence for precision/recall/F1 and the
-            confusion matrix.
+        confidence_threshold: Minimum confidence for the default P/R/F1 entry
+            and the confusion matrix.
         iou_threshold: IoU threshold for matching predictions to ground truths.
+        errors: Optional list of per-image error strings; used by the empty-
+            prediction zeroing rule (Req 8.5).
+        confidence_thresholds_sweep: Optional list of confidence thresholds to
+            sweep for the F1-analysis fields. When omitted, no sweep fields are
+            added to the returned dict.
 
     Returns:
         A metrics dict with keys ``map_50``, ``map_50_95``, ``per_class_ap``,
         ``precision``, ``recall``, ``f1_score``, and ``confusion_matrix`` (the
         latter a numpy array of shape ``(C, C)`` where ``C == len(class_names)``).
+        When ``confidence_thresholds_sweep`` is provided, the dict additionally
+        carries ``f1_sweep``, ``best_f1``, ``per_class_best_f1``, and
+        ``default_confidence_threshold``.
 
     Requirements: 8.1, 8.2, 8.3, 8.4, 8.5
     """
@@ -1247,6 +1287,54 @@ def compute_all_metrics(
         "recall": recall,
         "f1_score": f1_score,
         "confusion_matrix": confusion_matrix,
+        **_compute_sweep_metrics(
+            predictions=predictions,
+            ground_truths=ground_truths,
+            class_names=class_names,
+            confidence_threshold=confidence_threshold,
+            iou_threshold=iou_threshold,
+            confidence_thresholds_sweep=confidence_thresholds_sweep,
+        ),
+    }
+
+
+def _compute_sweep_metrics(
+    predictions: List[dict],
+    ground_truths: List[dict],
+    class_names: List[str],
+    confidence_threshold: float,
+    iou_threshold: float,
+    confidence_thresholds_sweep: Optional[List[float]],
+) -> dict:
+    """Return the F1-sweep auxiliary fields, or an empty dict when disabled.
+
+    When ``confidence_thresholds_sweep`` is ``None``, returns ``{}`` so that
+    legacy callers see the prior metric-dict shape unchanged. When a list is
+    supplied, returns the four sweep fields documented on
+    :func:`compute_all_metrics`.
+    """
+    if confidence_thresholds_sweep is None:
+        return {}
+
+    f1_sweep = compute_precision_recall_f1_sweep(
+        predictions=predictions,
+        ground_truths=ground_truths,
+        confidence_thresholds=confidence_thresholds_sweep,
+        iou_threshold=iou_threshold,
+    )
+    best_f1 = find_best_f1(f1_sweep)
+    per_class_best_f1 = compute_per_class_f1_sweep(
+        predictions=predictions,
+        ground_truths=ground_truths,
+        class_names=class_names,
+        confidence_thresholds=confidence_thresholds_sweep,
+        iou_threshold=iou_threshold,
+    )
+    return {
+        "f1_sweep": f1_sweep,
+        "best_f1": best_f1,
+        "per_class_best_f1": per_class_best_f1,
+        "default_confidence_threshold": float(confidence_threshold),
     }
 
 
@@ -1346,6 +1434,19 @@ def assemble_report(
         "recall": metrics["recall"],
         "f1_score": metrics["f1_score"],
     }
+
+    # Phase-2 F1-sweep fields: propagate when present in the metrics dict so
+    # the downstream report carries the full sweep curve, best-F1 entry,
+    # per-class best-F1 search, and the default operating threshold. Legacy
+    # callers that don't compute the sweep simply omit these four keys.
+    for sweep_key in (
+        "f1_sweep",
+        "best_f1",
+        "per_class_best_f1",
+        "default_confidence_threshold",
+    ):
+        if sweep_key in metrics:
+            report_metrics[sweep_key] = metrics[sweep_key]
 
     # Req 16.2: build the report with all required top-level fields.
     # Req 9.4: include the resolved evaluation.split value.
@@ -1664,18 +1765,50 @@ def evaluate(
         _, output_dir = _get_nested(config, ("evaluation", "output_dir"))
         _, dataset_path = _get_nested(config, ("dataset", "path"))
 
+        # Phase-2 (Option-3) F1-sweep: the evaluation report carries a curve
+        # of (precision, recall, F1) across a list of confidence thresholds so
+        # downstream comparison/reporting tools can pick a deployment point
+        # without re-running inference. The sweep is mandatory — a missing key
+        # is a configuration error rather than silently defaulting, so every
+        # run records the sweep it was scored against.
+        found_sweep, confidence_thresholds_sweep = _get_nested(
+            config, ("evaluation", "confidence_thresholds_sweep")
+        )
+        if not found_sweep or confidence_thresholds_sweep is None:
+            raise ConfigurationError(
+                [
+                    "evaluation.confidence_thresholds_sweep is required: "
+                    "supply a non-empty list of confidence thresholds in "
+                    "[0.0, 1.0] (e.g. [0.05, 0.10, ..., 0.50]) so the "
+                    "evaluation report can record the F1 sweep."
+                ]
+            )
+        if (
+            not isinstance(confidence_thresholds_sweep, list)
+            or len(confidence_thresholds_sweep) == 0
+        ):
+            raise ConfigurationError(
+                [
+                    "evaluation.confidence_thresholds_sweep must be a "
+                    "non-empty list of floats in [0.0, 1.0]; got "
+                    f"{confidence_thresholds_sweep!r}."
+                ]
+            )
+
         # -------------------------------------------------------------------------
         # Stage 8: Run inference (Req 1.2, 1.3, 7, 10.4)
         # -------------------------------------------------------------------------
         # Req 1.2: invoke inference exclusively through BaseDetector.forward().
         # Req 1.3: no conditional branches keyed on model type in inference path.
-        # Sync the evaluation confidence threshold to the detector so that its
-        # internal filtering (if any) uses the evaluation-level threshold rather
-        # than the model-config default.  This is done via a generic attribute
-        # set (no model_type-keyed branch) and is a no-op for detectors that do
-        # not perform internal confidence filtering.
+        # Phase-2 evaluation architecture: inference is always run at a low
+        # confidence floor (0.001) so the F1 sweep can build the full
+        # precision-recall curve. The evaluation-time ``confidence_threshold``
+        # is *only* used downstream for the confusion matrix and the default
+        # P/R/F1 entry — it is no longer used to truncate inference, which was
+        # the Phase-1 methodology bug that suppressed low-confidence true
+        # positives from the mAP calculation.
         if hasattr(detector, "confidence_threshold"):
-            detector.confidence_threshold = float(confidence_threshold)
+            detector.confidence_threshold = _INFERENCE_CONFIDENCE_FLOOR
         predictions, ground_truths, errors = run_inference(
             detector=detector,
             split_ds=split_ds,
@@ -1704,6 +1837,9 @@ def evaluate(
         confidence_threshold=float(confidence_threshold),
         iou_threshold=float(iou_threshold),
         errors=errors,
+        confidence_thresholds_sweep=[
+            float(c) for c in confidence_thresholds_sweep
+        ],
     )
 
     # -------------------------------------------------------------------------

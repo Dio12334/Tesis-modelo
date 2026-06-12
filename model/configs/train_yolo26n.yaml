@@ -18,11 +18,13 @@ dataset:
   class_mapping: model/configs/rdd2022_classes.yaml
 
 training:
-  epochs: 200
-  early_stopping_patience: 25
-  batch_size: 32
+  epochs: 100
+  early_stopping_patience: 15
+  batch_size: 64
   num_workers: 8
+  prefetch_factor: 3
   use_amp: true
+  use_channels_last: true
   learning_rate: 0.01
   optimizer: MuSGD
   weight_decay: 0.0005
@@ -41,7 +43,7 @@ training:
   augmentation:
     mosaic: 0.5
     mixup: 0.05
-    mosaic_off_epochs: 10
+    mosaic_off_epochs: 8
     horizontal_flip: true
     vertical_flip: false
     hsv_h: 0.015
@@ -53,6 +55,12 @@ training:
 evaluation:
   iou_thresholds: [0.5]
   confidence_threshold: 0.25
+  # F1-sweep operating points (Phase-2 evaluation architecture). Inference is
+  # always run at the 0.001 floor; this sweep is applied post-inference to
+  # build the (precision, recall, F1) curve and to pick the best F1 operating
+  # point reported alongside mAP. Required.
+  confidence_thresholds_sweep:
+    [0.05, 0.10, 0.15, 0.20, 0.25, 0.30, 0.35, 0.40, 0.45, 0.50]
 
 output:
   checkpoint_dir: ./checkpoints/yolo26

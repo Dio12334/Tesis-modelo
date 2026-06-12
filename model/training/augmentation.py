@@ -25,7 +25,13 @@ BBoxes = List[List]  # List of [x_min, y_min, x_max, y_max, class_label, ...]
 
 # Minimum bbox area (normalized) to keep after augmentation; smaller boxes are
 # discarded as slivers produced by cropping/clipping.
-MIN_BBOX_AREA = 0.001
+#
+# At input_size=640, area=0.0001 corresponds to roughly 41 px^2 (~6.4x6.4),
+# which is just above the floor below which a road-damage box is unlikely to
+# carry useful signal but well under the ~410 px^2 (~20x20) cutoff that the
+# previous value of 0.001 imposed (which silently dropped legitimately small
+# potholes after mosaic/scale shrinkage).
+MIN_BBOX_AREA = 0.0001
 
 
 def _clip_and_filter_bboxes(bboxes: BBoxes) -> BBoxes:

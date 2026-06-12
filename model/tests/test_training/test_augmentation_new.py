@@ -8,6 +8,7 @@ import pytest
 
 from model.training.augmentation import (
     Compose,
+    MIN_BBOX_AREA,
     RandomHSV,
     RandomHorizontalFlip,
     RandomScale,
@@ -69,10 +70,27 @@ class TestClipAndFilter:
         assert result[0][4] == "a"
 
     def test_removes_degenerate_area(self):
-        # Box with area < 0.001 after clipping
+        # Box with area below MIN_BBOX_AREA after clipping
         bboxes = [[0.5, 0.5, 0.501, 0.501, "b"]]  # area = 0.001 * 0.001 = 1e-6
         result = _clip_and_filter_bboxes(bboxes)
         assert len(result) == 0
+
+    def test_keeps_box_at_threshold(self):
+        # Box with area equal to MIN_BBOX_AREA must be kept (>= filter, not >)
+        side = MIN_BBOX_AREA ** 0.5  # ~0.01 for MIN_BBOX_AREA=0.0001
+        bboxes = [[0.4, 0.4, 0.4 + side, 0.4 + side, "x"]]
+        result = _clip_and_filter_bboxes(bboxes)
+        assert len(result) == 1, (
+            f"Expected box with area={side*side:.6f} (== MIN_BBOX_AREA={MIN_BBOX_AREA}) to be kept"
+        )
+
+    def test_keeps_small_box_above_new_threshold(self):
+        # Regression: a ~0.0005 box should survive (was incorrectly dropped
+        # under the legacy MIN_BBOX_AREA=0.001 threshold).
+        bboxes = [[0.5, 0.5, 0.5 + 0.025, 0.5 + 0.020, "small_pothole"]]  # 0.0005
+        result = _clip_and_filter_bboxes(bboxes)
+        assert len(result) == 1
+        assert result[0][4] == "small_pothole"
 
     def test_removes_inverted_box(self):
         bboxes = [[0.8, 0.8, 0.2, 0.2, "c"]]  # x_max < x_min after clip
@@ -363,5 +381,5 @@ class TestComposedPipeline:
                 x1, y1, x2, y2 = bbox[:4]
                 assert 0.0 <= x1 < x2 <= 1.0
                 assert 0.0 <= y1 < y2 <= 1.0
-                assert (x2 - x1) * (y2 - y1) >= 0.001
+                assert (x2 - x1) * (y2 - y1) >= MIN_BBOX_AREA
                 assert bbox[4] == "crack"  # class preserved
