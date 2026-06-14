@@ -107,7 +107,7 @@ def render_loss_chart(run: ExperimentRun) -> None:
         height=450,
     )
 
-    st.plotly_chart(fig, use_container_width=True)
+    st.plotly_chart(fig, width='stretch')
 
 
 def render_learning_rate_chart(run: ExperimentRun) -> None:
@@ -153,4 +153,4 @@ def render_learning_rate_chart(run: ExperimentRun) -> None:
         height=350,
     )
 
-    st.plotly_chart(fig, use_container_width=True)
+    st.plotly_chart(fig, width='stretch')

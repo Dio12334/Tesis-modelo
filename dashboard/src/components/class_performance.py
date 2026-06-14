@@ -67,4 +67,4 @@ def render_class_performance(report: Optional[EvaluationReport]) -> None:
         margin=dict(l=20, r=80, t=50, b=40),
     )
 
-    st.plotly_chart(fig, use_container_width=True)
+    st.plotly_chart(fig, width='stretch')

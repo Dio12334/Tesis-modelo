@@ -36,6 +36,7 @@ from model.evaluation.metrics import (
     compute_precision_recall_f1_sweep,
     find_best_f1,
 )
+from model.evaluation.region import compute_per_region_metrics
 from model.exceptions import (
     ConfigurationError,
     DatasetNotFoundError,
@@ -1359,6 +1360,7 @@ def assemble_report(
     confusion_matrix: List[List[int]],
     errors: List[str],
     display_class_names: Optional[List[str]] = None,
+    per_region: Optional[Dict[str, dict]] = None,
 ) -> dict:
     """Assemble the Evaluation_Report dict, validating required metric fields.
 
@@ -1371,6 +1373,13 @@ def assemble_report(
     present in the ``metrics`` dict. If any required field is missing, a
     :class:`RuntimeError` is raised that names every missing field, and the
     evaluation run is considered failed (Req 8.7).
+
+    Per-region breakdown (RDD2022): when ``per_region`` is supplied, its
+    region-keyed metric blocks are written under the top-level ``per_region``
+    field. Each block carries the same metric shape as the global metrics
+    object plus ``num_images`` and ``num_gt_boxes`` for that region. When
+    ``per_region`` is ``None``, the field is omitted so legacy callers and
+    non-RDD2022 runs see the prior schema unchanged.
 
     Required metric fields (Req 8.7):
         - ``map_50``
@@ -1397,6 +1406,12 @@ def assemble_report(
         confusion_matrix: The ``(C, C)`` confusion matrix as a nested list.
         errors: The list of error strings, each formatted as
             ``<image_id>: <exception text>``.
+        display_class_names: Optional translated display names parallel to
+            ``class_names``.
+        per_region: Optional region-keyed dict produced by
+            :func:`model.evaluation.region.compute_per_region_metrics`. When
+            present, each entry must already be JSON-serialisable (numpy
+            confusion matrices converted to nested lists).
 
     Returns:
         The assembled Evaluation_Report dict with all required fields.
@@ -1480,6 +1495,13 @@ def assemble_report(
             "items": errors,
         },
     }
+
+    # RDD2022 per-region breakdown: when supplied, surface the region-keyed
+    # metric blocks under a top-level ``per_region`` field. Legacy/non-RDD
+    # callers omit this kwarg and the field is left out entirely so the
+    # prior schema stays unchanged.
+    if per_region is not None:
+        report["per_region"] = per_region
 
     return report
 
@@ -1612,12 +1634,17 @@ def print_summary(
     split: str,
     num_images: int,
     metrics: dict,
+    per_region: Optional[Dict[str, dict]] = None,
 ) -> None:
     """Print a formatted evaluation summary to standard output.
 
     Prints a human-readable summary including the model type, split, number of
     images, and the five key metrics: ``map_50``, ``map_50_95``, ``precision``,
     ``recall``, and ``f1_score`` (Req 16.8).
+
+    When ``per_region`` is supplied, an extra section is printed showing the
+    five key metrics for each region (sorted alphabetically) so terminal users
+    immediately see how the model performs on each RDD2022 country slice.
 
     The summary is printed to stdout (not logged) so it appears prominently in
     the terminal regardless of logging configuration.
@@ -1628,6 +1655,9 @@ def print_summary(
         num_images: The number of images in the evaluation split.
         metrics: The metrics dict containing ``map_50``, ``map_50_95``,
             ``precision``, ``recall``, and ``f1_score``.
+        per_region: Optional region-keyed metric blocks as produced by
+            :func:`model.evaluation.region.compute_per_region_metrics`. When
+            present, a per-region table is appended after the global summary.
 
     Requirements: 16.8
     """
@@ -1645,6 +1675,25 @@ def print_summary(
     print(f"  Recall:        {metrics['recall']:.4f}")
     print(f"  F1-score:      {metrics['f1_score']:.4f}")
     print("=" * 60 + "\n")
+
+    if per_region:
+        print("PER-REGION SUMMARY")
+        print("=" * 78)
+        print(
+            f"  {'Region':<18}{'Imgs':>6}  {'mAP50':>7}  {'mAP':>7}  "
+            f"{'P':>7}  {'R':>7}  {'F1':>7}"
+        )
+        print("-" * 78)
+        for region in sorted(per_region.keys()):
+            block = per_region[region]
+            m = block["metrics"]
+            print(
+                f"  {region:<18}{block['num_images']:>6}  "
+                f"{m['map_50']:>7.4f}  {m['map_50_95']:>7.4f}  "
+                f"{m['precision']:>7.4f}  {m['recall']:>7.4f}  "
+                f"{m['f1_score']:>7.4f}"
+            )
+        print("=" * 78 + "\n")
 
 
 def evaluate(
@@ -1849,6 +1898,39 @@ def evaluate(
     )
 
     # -------------------------------------------------------------------------
+    # Stage 9b: Compute per-region (RDD2022 country) metrics
+    # -------------------------------------------------------------------------
+    # Slices the aligned predictions/ground-truths by region prefix
+    # (Japan, Czech, India, Norway, United_States, China_Drone,
+    # China_MotorBike) and computes a full metric block per region. Images
+    # whose filenames don't match the RDD2022 pattern are skipped. The
+    # resulting dict is empty when no images can be attributed to any
+    # region, in which case the ``per_region`` field is omitted from the
+    # final report.
+    logger.info("Computing per-region metrics...")
+    per_region_metrics = compute_per_region_metrics(
+        predictions=predictions,
+        ground_truths=ground_truths,
+        class_names=class_names,
+        confidence_threshold=float(confidence_threshold),
+        iou_threshold=float(iou_threshold),
+        confidence_thresholds_sweep=[
+            float(c) for c in confidence_thresholds_sweep
+        ],
+    )
+    if per_region_metrics:
+        logger.info(
+            "Per-region metrics computed for %d region(s): %s",
+            len(per_region_metrics),
+            ", ".join(sorted(per_region_metrics.keys())),
+        )
+    else:
+        logger.info(
+            "No images matched the RDD2022 region pattern; "
+            "per_region field will be omitted from the report."
+        )
+
+    # -------------------------------------------------------------------------
     # Stage 10: Assemble report (Req 8.6, 8.7, 9.4, 16.2, 17.4)
     # -------------------------------------------------------------------------
     # Convert confusion matrix to list for JSON serialization.
@@ -1871,6 +1953,7 @@ def evaluate(
         confusion_matrix=confusion_matrix,
         errors=errors,
         display_class_names=display_class_names,
+        per_region=per_region_metrics if per_region_metrics else None,
     )
 
     # -------------------------------------------------------------------------
@@ -1893,6 +1976,7 @@ def evaluate(
         split=split,
         num_images=len(predictions),
         metrics=report["metrics"],
+        per_region=report.get("per_region"),
     )
 
     # Release detector resources after successful completion.

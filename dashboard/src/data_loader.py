@@ -64,6 +64,11 @@ class EvaluationReport:
     metrics: dict
     confusion_matrix: list[list[int]]
     display_class_names: Optional[list[str]] = None
+    # Region-keyed metric blocks produced during evaluation (or by the
+    # ``model.scripts.backfill_per_region`` CLI). Empty when the report
+    # predates the per-region feature; the dashboard falls back to "All"
+    # in that case.
+    per_region: dict = field(default_factory=dict)
 
 
 @dataclass
@@ -179,6 +184,7 @@ def load_evaluation_report(filepath: Path) -> EvaluationReport:
         metrics=data["metrics"],
         confusion_matrix=data["confusion_matrix"],
         display_class_names=data.get("display_class_names"),
+        per_region=data.get("per_region") or {},
     )
 
 
