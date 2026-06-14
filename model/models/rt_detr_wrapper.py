@@ -71,6 +71,9 @@ class RT_DETR_Detector(BaseDetector):
         self.num_classes: int = config["num_classes"]
         self.confidence_threshold: float = config.get("confidence_threshold", 0.25)
         self.iou_threshold: float = config.get("iou_threshold", 0.7)
+        self._backbone_lr: Optional[float] = config.get("backbone_lr")
+        self._head_lr: Optional[float] = config.get("head_lr")
+        self._backbone_layers: int = config.get("backbone_layers", 10)
 
         # Initialize the model
         self._device: Optional[Any] = None
@@ -348,25 +351,37 @@ class RT_DETR_Detector(BaseDetector):
                     exc,
                 )
 
+    # Ultralytics defaults for RTDETRDetectionLoss.loss_gain
+    _DEFAULT_LOSS_GAIN: dict = {
+        "class": 1.0,
+        "bbox": 5.0,
+        "giou": 2.0,
+        "no_object": 0.1,
+        "mask": 1.0,
+        "dice": 1.0,
+    }
+
     def _build_loss_fn(self) -> None:
         """Set up the loss computation from the Ultralytics model.
 
         RT-DETR uses RTDETRDetectionLoss (Hungarian matching + set prediction loss).
         When loading from a .pt file, Ultralytics may create a generic DetectionModel
         instead of RTDETRDetectionModel, so we patch the model's class to enable the
-        correct loss path.
+        correct ``loss()`` method.
 
-        Critically, ``model_module.nc`` is set to ``self.num_classes`` BEFORE
-        ``init_criterion()`` is called, so the criterion is built against the
-        correct class count. This complements ``_reshape_head_if_needed()``,
-        which has already updated ``decoder.nc`` and rebuilt the classification
-        modules.
+        Loss parameters are read from ``config["loss"]`` (populated by
+        ``train_detection.py`` from the YAML ``training.loss`` section):
 
-        We do NOT pre-populate ``model_module.args`` with YOLO's ``box``/``cls``/``dfl``
-        loss-weight defaults: ``RTDETRDetectionLoss.__init__`` does not read those
-        keys (verified against ultralytics.models.utils.loss). It uses its own
-        ``loss_gain`` defaults: ``{"class": 1, "bbox": 5, "giou": 2, "no_object": 0.1}``.
-        Setting the YOLO keys is dead state that obscures intent.
+        - ``focal_loss`` (bool)  → ``use_fl``       default True
+        - ``focal_gamma`` (float) → ``gamma``        default 1.5
+        - ``focal_alpha`` (float) → ``alpha``        default 0.25
+        - ``no_object_weight`` (float) → ``loss_gain["no_object"]``  default 0.1
+        - ``class_weight`` (float)    → ``loss_gain["class"]``       default 1.0
+        - ``bbox_weight`` (float)     → ``loss_gain["bbox"]``        default 5.0
+        - ``giou_weight`` (float)     → ``loss_gain["giou"]``        default 2.0
+
+        Note: ``label_smoothing`` is not a parameter of ``RTDETRDetectionLoss``
+        and is ignored.
 
         Raises:
             RuntimeError: If the constructed criterion's nc attribute does not
@@ -378,7 +393,7 @@ class RT_DETR_Detector(BaseDetector):
         model_module = self._model.model
 
         # Patch the model class to RTDETRDetectionModel if needed so that the
-        # correct ``init_criterion()`` and ``loss()`` methods are used.
+        # correct ``loss()`` method is available during train_step.
         try:
             from ultralytics.models.rtdetr.model import RTDETRDetectionModel
 
@@ -391,26 +406,52 @@ class RT_DETR_Detector(BaseDetector):
         except (ImportError, AttributeError, IndexError, TypeError):
             pass
 
-        # Force model_module.nc to the configured num_classes BEFORE init_criterion.
-        # This is the single most important line for correct loss adaptation.
+        # Force model_module.nc to the configured num_classes BEFORE building
+        # the criterion so init_criterion / RTDETRDetectionLoss read the right nc.
         model_module.nc = self.num_classes
 
-        # Initialize criterion via the model's init_criterion method.
-        # RTDETRDetectionLoss is built with nc=model_module.nc, so this picks up
-        # our corrected value.
-        if hasattr(model_module, "init_criterion"):
-            try:
-                self._loss_fn = model_module.init_criterion()
-                model_module.criterion = self._loss_fn
-            except Exception:
+        # Build loss_gain from config overrides on top of Ultralytics defaults.
+        loss_cfg = self.config.get("loss", {})
+        loss_gain = dict(self._DEFAULT_LOSS_GAIN)
+        loss_gain["no_object"] = float(loss_cfg.get("no_object_weight", loss_gain["no_object"]))
+        loss_gain["class"] = float(loss_cfg.get("class_weight", loss_gain["class"]))
+        loss_gain["bbox"] = float(loss_cfg.get("bbox_weight", loss_gain["bbox"]))
+        loss_gain["giou"] = float(loss_cfg.get("giou_weight", loss_gain["giou"]))
+        gamma = float(loss_cfg.get("focal_gamma", 1.5))
+        alpha = float(loss_cfg.get("focal_alpha", 0.25))
+        use_fl = bool(loss_cfg.get("focal_loss", True))
+
+        try:
+            from ultralytics.models.utils.loss import RTDETRDetectionLoss
+
+            self._loss_fn = RTDETRDetectionLoss(
+                nc=self.num_classes,
+                loss_gain=loss_gain,
+                gamma=gamma,
+                alpha=alpha,
+                use_fl=use_fl,
+            )
+            model_module.criterion = self._loss_fn
+            logger.info(
+                "RTDETRDetectionLoss: no_object=%.2f class=%.1f bbox=%.1f giou=%.1f "
+                "focal_gamma=%.2f focal_alpha=%.2f use_fl=%s",
+                loss_gain["no_object"], loss_gain["class"], loss_gain["bbox"],
+                loss_gain["giou"], gamma, alpha, use_fl,
+            )
+        except Exception:
+            # Fallback: let the model build its own default criterion.
+            if hasattr(model_module, "init_criterion"):
+                try:
+                    self._loss_fn = model_module.init_criterion()
+                    model_module.criterion = self._loss_fn
+                except Exception:
+                    self._loss_fn = None
+            elif hasattr(model_module, "criterion") and model_module.criterion is not None:
+                self._loss_fn = model_module.criterion
+            else:
                 self._loss_fn = None
-        elif hasattr(model_module, "criterion") and model_module.criterion is not None:
-            self._loss_fn = model_module.criterion
-        else:
-            self._loss_fn = None
 
         # Defensive assertion: criterion's nc must match self.num_classes.
-        # Hard failure here is preferable to silent training against wrong nc.
         if self._loss_fn is not None and hasattr(self._loss_fn, "nc"):
             criterion_nc = self._loss_fn.nc
             # Only enforce when nc is a concrete int (skip Mocks in unit tests).
@@ -460,13 +501,28 @@ class RT_DETR_Detector(BaseDetector):
         """Set the underlying model to evaluation mode."""
         self._model.model.eval()
 
-    def get_parameters(self) -> List["torch.nn.Parameter"]:
-        """Return trainable model parameters for optimizer construction.
+    def get_parameters(self):
+        """Return trainable parameters for optimizer construction.
 
-        Returns:
-            List of torch.nn.Parameter objects with requires_grad=True.
+        If backbone_lr and head_lr are configured, returns a list of param-group
+        dicts so the optimizer uses discriminative learning rates (lower LR for
+        the pretrained backbone, higher LR for the decoder heads). Otherwise
+        returns a flat list of Parameters (existing behaviour).
         """
-        return [p for p in self._model.model.parameters() if p.requires_grad]
+        if self._backbone_lr is None or self._head_lr is None:
+            return [p for p in self._model.model.parameters() if p.requires_grad]
+
+        all_named = list(self._model.model.named_parameters())
+        backbone_params = [
+            p for _, p in all_named[: self._backbone_layers] if p.requires_grad
+        ]
+        head_params = [
+            p for _, p in all_named[self._backbone_layers :] if p.requires_grad
+        ]
+        return [
+            {"params": backbone_params, "lr": self._backbone_lr},
+            {"params": head_params, "lr": self._head_lr},
+        ]
 
     def to_device(self, device) -> None:
         """Move the model to the specified device.

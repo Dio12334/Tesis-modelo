@@ -541,26 +541,52 @@ def collate_fn(batch):
 
 
 def _get_model_state_dict(model):
-    """Extract state dict from various model wrapper patterns."""
+    """Extract state dict from various model wrapper patterns.
+
+    Always strips the ``_orig_mod.`` prefix added by ``torch.compile`` so that
+    saved checkpoints are portable regardless of whether the model was compiled.
+    """
     if hasattr(model, "_model") and hasattr(model._model, "model"):
-        return model._model.model.state_dict()
+        sd = model._model.model.state_dict()
     elif hasattr(model, "_model"):
-        return model._model.state_dict()
+        sd = model._model.state_dict()
     elif hasattr(model, "model"):
-        return model.model.state_dict()
-    return model.state_dict()
+        sd = model.model.state_dict()
+    else:
+        sd = model.state_dict()
+    # Strip torch.compile prefix for checkpoint portability
+    return {(k[len("_orig_mod."):] if k.startswith("_orig_mod.") else k): v
+            for k, v in sd.items()}
 
 
 def _set_model_state_dict(model, state_dict):
-    """Load state dict into various model wrapper patterns."""
+    """Load state dict into various model wrapper patterns.
+
+    Handles the ``torch.compile`` case: if the target is an ``OptimizedModule``
+    (keys prefixed ``_orig_mod.``) but the checkpoint has plain keys, the prefix
+    is added automatically before calling ``load_state_dict``.
+    """
     if hasattr(model, "_model") and hasattr(model._model, "model"):
-        model._model.model.load_state_dict(state_dict)
+        target = model._model.model
     elif hasattr(model, "_model"):
-        model._model.load_state_dict(state_dict)
+        target = model._model
     elif hasattr(model, "model"):
-        model.model.load_state_dict(state_dict)
+        target = model.model
     else:
-        model.load_state_dict(state_dict)
+        target = model
+
+    # Detect _orig_mod prefix mismatch (compiled model vs. plain checkpoint)
+    target_keys = set(target.state_dict().keys())
+    ckpt_keys = set(state_dict.keys())
+    compiled_target = any(k.startswith("_orig_mod.") for k in target_keys)
+    compiled_ckpt = any(k.startswith("_orig_mod.") for k in ckpt_keys)
+    if compiled_target and not compiled_ckpt:
+        state_dict = {"_orig_mod." + k: v for k, v in state_dict.items()}
+    elif not compiled_target and compiled_ckpt:
+        state_dict = {(k[len("_orig_mod."):] if k.startswith("_orig_mod.") else k): v
+                      for k, v in state_dict.items()}
+
+    target.load_state_dict(state_dict)
 
 
 def _save_training_state(path, model, optimizer, scheduler, scaler, epoch,
@@ -1044,7 +1070,6 @@ def train(config_path: str, verbose: bool = False, resume_from: Optional[str] = 
 
                 # Handle zero-loss batches: skip backward/step
                 if loss_tensor.item() == 0.0:
-                    train_batches += 1
                     continue
 
                 # Backward pass with gradient scaling
@@ -1052,7 +1077,8 @@ def train(config_path: str, verbose: bool = False, resume_from: Optional[str] = 
 
                 # Unscale gradients before clipping
                 scaler.unscale_(optimizer)
-                torch.nn.utils.clip_grad_norm_(model.get_parameters(), max_norm=10.0)
+                _clip_params = [p for g in optimizer.param_groups for p in g["params"]]
+                torch.nn.utils.clip_grad_norm_(_clip_params, max_norm=10.0)
 
                 # Optimizer step (scaler.step is a no-op if inf/NaN detected)
                 scaler.step(optimizer)
@@ -1089,6 +1115,8 @@ def train(config_path: str, verbose: bool = False, resume_from: Optional[str] = 
                     try:
                         loss_dict = model.train_step(images, targets)
                         loss_tensor = loss_dict["loss_tensor"]
+                        if loss_tensor.item() == 0.0:
+                            continue
                         val_loss_sum += loss_tensor.item()
                         val_batches += 1
                     except Exception as e:
