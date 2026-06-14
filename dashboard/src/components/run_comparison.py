@@ -586,9 +586,9 @@ def _render_comparison_table(
             return [""] * len(row)
 
         styled = df.style.apply(highlight_best, axis=1)
-        st.dataframe(styled, use_container_width=True, hide_index=True)
+        st.dataframe(styled, width='stretch', hide_index=True)
     else:
-        st.dataframe(df, use_container_width=True, hide_index=True)
+        st.dataframe(df, width='stretch', hide_index=True)
 
 
 def _render_overlay_loss_chart(selected_runs: list[ExperimentRun]) -> None:
@@ -647,7 +647,7 @@ def _render_overlay_loss_chart(selected_runs: list[ExperimentRun]) -> None:
         height=500,
     )
 
-    st.plotly_chart(fig, use_container_width=True)
+    st.plotly_chart(fig, width='stretch')
 
 
 def _any_run_has_sweep(
@@ -740,7 +740,7 @@ def render_run_comparison(
             _build_f1_vs_conf_figure(
                 chosen_runs, data.evaluation_report, data.evaluation_reports
             ),
-            use_container_width=True,
+            width='stretch',
         )
 
         st.subheader("Precision vs Recall (paramétrico en confianza)")
@@ -748,7 +748,7 @@ def render_run_comparison(
             _build_pr_parametric_figure(
                 chosen_runs, data.evaluation_report, data.evaluation_reports
             ),
-            use_container_width=True,
+            width='stretch',
         )
     else:
         st.info("F1 sweep no disponible para los runs seleccionados.")
@@ -767,7 +767,7 @@ def render_run_comparison(
                 data.evaluation_reports,
                 metric_key="per_class_best_f1",
             ),
-            use_container_width=True,
+            width='stretch',
         )
 
     if _any_run_has_per_class(
@@ -784,7 +784,7 @@ def render_run_comparison(
                 data.evaluation_reports,
                 metric_key="per_class_ap",
             ),
-            use_container_width=True,
+            width='stretch',
         )
 
     st.subheader("Loss Curves Overlay")
