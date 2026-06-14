@@ -6,9 +6,12 @@ model:
     model_size: "l"
     input_size: 640
     num_classes: 5
-    confidence_threshold: 0.25
-    iou_threshold: 0.7
-    freeze_layers: 19  # Number of initial layers to freeze (0 to total_layers). Optional.
+    confidence_threshold: 0.5
+    iou_threshold: 0.5
+    freeze_layers: 10  # Number of initial layers to freeze (0 to total_layers). Optional.
+    backbone_lr: 0.00001   # low LR for frozen-adjacent backbone layers
+    head_lr: 0.0001        # normal LR for encoder/decoder/heads
+    backbone_layers: 10    # first N named-parameter groups treated as backbone
 
 dataset:
   type: rdd2022
@@ -31,13 +34,38 @@ training:
   checkpoint_dir: ./checkpoints/rt_detr
   log_interval: 10
   seed: 42
+
+  early_stopping_metric: map
+  eval_interval: 5
+
+  loss:
+    # Focal loss — applied to the classification head of RTDETRDetectionLoss
+    focal_loss: true          # use_fl: set false to switch to standard cross-entropy
+    focal_gamma: 2.0          # focusing parameter — higher = more weight on hard examples
+    focal_alpha: 0.20         # class balance factor for positive examples (lower = more precision)
+
+    # Loss component weights (RTDETRDetectionLoss.loss_gain defaults in parentheses)
+    no_object_weight: 0.3     # penalty for predicting boxes on empty regions (default: 0.1) — raise to reduce FPs
+    class_weight: 1.0         # classification loss weight (default: 1.0)
+    bbox_weight: 5.0          # bounding box L1 loss weight (default: 5.0)
+    giou_weight: 2.0          # GIoU loss weight (default: 2.0)
+
+    # Note: label_smoothing is NOT supported by RTDETRDetectionLoss and is ignored
+
   augmentation:
     horizontal_flip: true
-    brightness_range: [0.8, 1.2]
+    mosaic: 0.5
+    mixup: 0.1
+    mosaic_off_epochs: 10
+    hsv_h: 0.015
+    hsv_s: 0.5
+    hsv_v: 0.4
+    scale: [0.5, 1.5]
+    translate: 0.1
 
 evaluation:
   iou_thresholds: [0.25, 0.5, 0.75]
-  confidence_threshold: 0.25
+  confidence_threshold: 0.5
   # F1-sweep operating points (Phase-2 evaluation architecture). Required.
   confidence_thresholds_sweep:
     [0.05, 0.10, 0.15, 0.20, 0.25, 0.30, 0.35, 0.40, 0.45, 0.50]

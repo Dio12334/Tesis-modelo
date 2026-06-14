@@ -1,0 +1,40 @@
+name: rdd2022_two_stage
+
+# Two-stage inference pipeline:
+#   Stage 1: BinaryDamageClassifier filters background images
+#   Stage 2: Detection model runs only on images flagged as damaged
+
+model:
+  type: two_stage
+  config:
+    # --- Stage 1: binary classifier ---
+    classifier_checkpoint: ./checkpoints/binary_classifier/8fa192b0-27ac-4b4c-ab42-302cb5221d34/best_model.pt
+    classifier_architecture: efficientnet_b2
+    classifier_input_size: 260     # MUST match the input_size used during classifier training
+    classifier_threshold: 0.15     # sweet spot from F1 sweep: recall=0.9157, F1=0.9007
+
+    # --- Stage 2: detection model ---
+    detector_type: rt_detr         # any registered model: rt_detr, mmr_detr, yolo26, ...
+    detector_checkpoint: ./checkpoints/rt_detr/5eee5bb9-5e96-434a-be3e-fd552301a932/best_model.pt
+    num_classes: 5
+    detector_config:
+      model_size: "l"
+      num_classes: 5
+      confidence_threshold: 0.5
+      iou_threshold: 0.5
+
+dataset:
+  type: rdd2022
+  path: model/data/rdd2022/
+  class_mapping: model/configs/rdd2022_classes.yaml
+
+evaluation:
+  split: val
+  iou_thresholds: [0.25, 0.5, 0.75]
+  confidence_threshold: 0.50   # best_f1 threshold from sweep (F1=0.5859 vs F1=0.4474 at 0.25)
+  confidence_thresholds_sweep:
+    [0.05, 0.10, 0.15, 0.20, 0.25, 0.30, 0.35, 0.40, 0.45, 0.50]
+
+output:
+  results_dir: ./results/two_stage
+  log_dir: ./logs/two_stage
