@@ -85,6 +85,42 @@ def create_parser() -> argparse.ArgumentParser:
         help="Path to output directory for annotated images.",
     )
 
+    # train-classifier subcommand
+    train_cls_parser = subparsers.add_parser(
+        "train-classifier",
+        help="Train the binary damage classifier (background vs. damage).",
+    )
+    train_cls_parser.add_argument(
+        "--config",
+        type=str,
+        required=True,
+        help="Path to the classifier training configuration YAML file.",
+    )
+
+    # evaluate-classifier subcommand
+    eval_cls_parser = subparsers.add_parser(
+        "evaluate-classifier",
+        help="Evaluate a trained binary classifier and write a dashboard-compatible report.",
+    )
+    eval_cls_parser.add_argument(
+        "--config",
+        type=str,
+        required=True,
+        help="Path to the classifier training config YAML (same used for training).",
+    )
+    eval_cls_parser.add_argument(
+        "--checkpoint",
+        type=str,
+        required=True,
+        help="Path to the best_model.pt checkpoint file.",
+    )
+    eval_cls_parser.add_argument(
+        "--split",
+        type=str,
+        default="val",
+        help="Dataset split to evaluate on: 'val' (default) or 'train'.",
+    )
+
     # list-models subcommand
     subparsers.add_parser(
         "list-models",
@@ -259,6 +295,49 @@ def handle_predict(args: argparse.Namespace) -> None:
         print(f"Result saved to: {out_file}")
 
 
+def handle_evaluate_classifier(args: argparse.Namespace) -> None:
+    """Handle the evaluate-classifier subcommand."""
+    from model.training.train_classifier import evaluate_classifier
+
+    results = evaluate_classifier(
+        config_path=args.config,
+        checkpoint_path=args.checkpoint,
+        split=args.split,
+    )
+
+    print(f"\nEvaluation complete.")
+    print(f"  AUC-ROC:        {results.get('auc_roc', 'N/A'):.4f}")
+    print(f"  Precision:      {results.get('precision', 'N/A'):.4f}")
+    print(f"  Recall:         {results.get('recall', 'N/A'):.4f}")
+    print(f"  F1 (threshold): {results.get('f1', 'N/A'):.4f}")
+    print(f"  Best F1:        {results.get('best_f1', 'N/A'):.4f}  @ threshold={results.get('best_threshold', 'N/A')}")
+    print(f"  Report:         {results.get('report_path', 'N/A')}")
+
+
+def handle_train_classifier(args: argparse.Namespace) -> None:
+    """Handle the train-classifier subcommand.
+
+    Delegates to train_classifier.py which trains a BinaryDamageClassifier
+    on RDD2022 using binary labels derived from annotation presence.
+
+    Args:
+        args: Parsed command-line arguments.
+    """
+    from model.training.train_classifier import train_classifier
+
+    config_path = args.config
+    verbose = getattr(args, "verbose", False)
+
+    logger.info("Training binary classifier with config: %s", config_path)
+    results = train_classifier(config_path=config_path, verbose=verbose)
+
+    print(f"\nTraining complete.")
+    print(f"  Best val AUC-ROC: {results.get('best_val_auc', 'N/A'):.4f}")
+    print(f"  Best epoch:       {results.get('best_epoch', 'N/A')}")
+    print(f"  Total epochs:     {results.get('total_epochs', 'N/A')}")
+    print(f"  Best model:       {results.get('best_model_path', 'N/A')}")
+
+
 def handle_list_models(args: argparse.Namespace) -> None:
     """Handle the list-models subcommand.
 
@@ -308,6 +387,8 @@ def main(argv: Optional[List[str]] = None) -> None:
     # Dispatch to handler
     handlers = {
         "train": handle_train,
+        "train-classifier": handle_train_classifier,
+        "evaluate-classifier": handle_evaluate_classifier,
         "evaluate": handle_evaluate,
         "predict": handle_predict,
         "list-models": handle_list_models,
