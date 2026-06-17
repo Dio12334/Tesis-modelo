@@ -808,7 +808,19 @@ def train(config_path: str, verbose: bool = False, resume_from: Optional[str] = 
             logger.warning("channels_last conversion failed, continuing in default layout: %s", e)
 
     # Compile model for faster CUDA execution (torch.compile, requires PyTorch 2.0+)
-    if hasattr(torch, "compile") and device.type == "cuda":
+    # Skipped when either the YAML opts out (``training.use_torch_compile: false``)
+    # or the wrapper declares it doesn't support compilation
+    # (``BaseDetector.supports_torch_compile`` returning False; e.g. torchvision SSD,
+    # whose training-time forward triggers graph breaks from ``.item()`` and
+    # ``random.choice`` inside GeneralizedRCNNTransform).
+    yaml_compile_pref = training_config.get("use_torch_compile", None)
+    if yaml_compile_pref is None:
+        # No explicit YAML preference: defer to the wrapper.
+        wants_compile = bool(model.supports_torch_compile())
+    else:
+        wants_compile = bool(yaml_compile_pref)
+
+    if hasattr(torch, "compile") and device.type == "cuda" and wants_compile:
         try:
             if hasattr(model, "_model") and hasattr(model._model, "model"):
                 model._model.model = torch.compile(model._model.model, mode="reduce-overhead")
@@ -819,6 +831,13 @@ def train(config_path: str, verbose: bool = False, resume_from: Optional[str] = 
             logger.info("Model compiled with torch.compile (mode=reduce-overhead)")
         except Exception as e:
             logger.warning("torch.compile failed, continuing without compilation: %s", e)
+    elif not wants_compile:
+        reason = (
+            "YAML training.use_torch_compile=false"
+            if yaml_compile_pref is False
+            else f"{type(model).__name__}.supports_torch_compile()=False"
+        )
+        logger.info("Skipping torch.compile (%s)", reason)
 
 
     logger.info("Loading dataset from %s", dataset_path)
@@ -882,49 +901,60 @@ def train(config_path: str, verbose: bool = False, resume_from: Optional[str] = 
     )
 
     # --- Construct optimizer from model.get_parameters() ---
-    params = model.get_parameters()
-    if optimizer_name.upper() == "SGD":
-        optimizer = torch.optim.SGD(
-            params, lr=learning_rate, momentum=momentum, weight_decay=weight_decay
-        )
-    elif optimizer_name.upper() == "ADAM":
-        optimizer = torch.optim.Adam(params, lr=learning_rate, weight_decay=weight_decay)
-    elif optimizer_name.upper() == "ADAMW":
-        optimizer = torch.optim.AdamW(params, lr=learning_rate, weight_decay=weight_decay)
-    elif optimizer_name.upper() == "MUSGD":
-        try:
-            from ultralytics.optim.muon import MuSGD
-            # MuSGD needs parameter groups: use_muon=True only for ndim >= 2
-            muon_params = []
-            sgd_params = []
-            for p in params:
-                if p.ndim >= 2:
-                    muon_params.append(p)
-                else:
-                    sgd_params.append(p)
-            param_groups = [
-                {"params": muon_params, "use_muon": True},
-                {"params": sgd_params, "use_muon": False},
-            ]
-            optimizer = MuSGD(
-                param_groups, lr=learning_rate, momentum=momentum,
-                weight_decay=weight_decay, nesterov=True,
-                muon=0.2, sgd=1.0,
-            )
-            logger.info("Using MuSGD optimizer (Muon + SGD hybrid)")
-        except ImportError:
-            logger.warning(
-                "MuSGD requested but ultralytics is not installed. Falling back to SGD."
-            )
-            optimizer = torch.optim.SGD(
+    def _build_optimizer():
+        """Construct an optimizer using the model's current parameter set.
+
+        Factored out so the training loop can rebuild the optimizer mid-training
+        when the model toggles ``requires_grad`` (e.g. unfreezing a backbone
+        after ``freeze_backbone_epochs``). PyTorch optimizers do not pick up
+        newly-enabled parameters once constructed.
+        """
+        params = model.get_parameters()
+        if optimizer_name.upper() == "SGD":
+            return torch.optim.SGD(
                 params, lr=learning_rate, momentum=momentum, weight_decay=weight_decay
             )
-    else:
-        # Fallback to SGD for unknown optimizer values
-        logger.warning("Unknown optimizer '%s', falling back to SGD", optimizer_name)
-        optimizer = torch.optim.SGD(
-            params, lr=learning_rate, momentum=momentum, weight_decay=weight_decay
-        )
+        elif optimizer_name.upper() == "ADAM":
+            return torch.optim.Adam(params, lr=learning_rate, weight_decay=weight_decay)
+        elif optimizer_name.upper() == "ADAMW":
+            return torch.optim.AdamW(params, lr=learning_rate, weight_decay=weight_decay)
+        elif optimizer_name.upper() == "MUSGD":
+            try:
+                from ultralytics.optim.muon import MuSGD
+                # MuSGD needs parameter groups: use_muon=True only for ndim >= 2
+                muon_params = []
+                sgd_params = []
+                for p in params:
+                    if p.ndim >= 2:
+                        muon_params.append(p)
+                    else:
+                        sgd_params.append(p)
+                param_groups = [
+                    {"params": muon_params, "use_muon": True},
+                    {"params": sgd_params, "use_muon": False},
+                ]
+                opt = MuSGD(
+                    param_groups, lr=learning_rate, momentum=momentum,
+                    weight_decay=weight_decay, nesterov=True,
+                    muon=0.2, sgd=1.0,
+                )
+                logger.info("Using MuSGD optimizer (Muon + SGD hybrid)")
+                return opt
+            except ImportError:
+                logger.warning(
+                    "MuSGD requested but ultralytics is not installed. Falling back to SGD."
+                )
+                return torch.optim.SGD(
+                    params, lr=learning_rate, momentum=momentum, weight_decay=weight_decay
+                )
+        else:
+            # Fallback to SGD for unknown optimizer values
+            logger.warning("Unknown optimizer '%s', falling back to SGD", optimizer_name)
+            return torch.optim.SGD(
+                params, lr=learning_rate, momentum=momentum, weight_decay=weight_decay
+            )
+
+    optimizer = _build_optimizer()
 
     # --- Learning rate scheduler: cosine annealing (stepped only after warmup) ---
     cosine_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
@@ -1019,6 +1049,27 @@ def train(config_path: str, verbose: bool = False, resume_from: Optional[str] = 
     try:
         for epoch in range(start_epoch, epochs):
             epoch_start = time.time()
+
+            # --- Per-epoch model hook (e.g. backbone freeze/unfreeze) ---
+            model.on_epoch_start(epoch)
+            if model.requires_optimizer_rebuild():
+                logger.info(
+                    "Epoch %d: rebuilding optimizer because model parameter set changed.",
+                    epoch + 1,
+                )
+                optimizer = _build_optimizer()
+                # Rebuild scheduler too so its internal LR state matches the
+                # new optimizer instance. Use the remaining post-warmup
+                # epochs as T_max so cosine decay continues smoothly.
+                remaining = max(epochs - max(epoch, warmup_epochs), 1)
+                cosine_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+                    optimizer, T_max=remaining, eta_min=learning_rate * 0.01
+                )
+                # Re-create the AMP grad scaler too: scaler state is tied to
+                # the optimizer's param refs only loosely, but we keep it
+                # consistent for clarity.
+                scaler = torch.amp.GradScaler('cuda', enabled=use_amp)
+                model.acknowledge_optimizer_rebuild()
 
             # --- Mosaic off for final N epochs (fine-tune on clean images) ---
             if mosaic_off_epochs > 0 and epoch >= (epochs - mosaic_off_epochs):

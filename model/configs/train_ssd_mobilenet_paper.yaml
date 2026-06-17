@@ -1,0 +1,71 @@
+name: rdd2022_ssd_mobilenetv3_large_paper
+
+# Paper-faithful reproduction config for SSDLite + MobileNetV3-Large on
+# RDD2022, mirroring Hasan & Ahmed's fine-tuning recipe (Adam, batch 4).
+# Use this for the "paper reproduction" row of the thesis comparison table.
+# train_ssd_mobilenet.yaml is the optimised version used for headline numbers.
+#
+# Differences vs. the optimised config:
+#  * input_size: 320 (true SSDLite-320 spec)
+#  * Adam optimiser, batch_size 4 (matches the paper's fine-tuning recipe)
+#  * No backbone freeze schedule, no discriminative LR
+#  * Minimal augmentation (flip + ImageNet normalisation only)
+#  * Fewer epochs (50) so the run completes faster as a baseline reference
+
+model:
+  type: ssd_mobilenetv3
+  config:
+    input_size: 320
+    num_classes: 5
+    pretrained_backbone: true
+    trainable_backbone_layers: 6
+    confidence_threshold: 0.25
+    score_threshold: 0.001
+    nms_threshold: 0.55              # torchvision SSDLite-320 default
+    detections_per_image: 300
+    topk_candidates: 300
+
+dataset:
+  type: rdd2022
+  path: model/data/rdd2022/complete
+  class_mapping: model/configs/rdd2022_classes.yaml
+  country_filter: [Japan, India, Czech, United States]
+
+training:
+  epochs: 50
+  early_stopping_patience: 10
+  batch_size: 4                       # matches paper's fine-tuning recipe
+  num_workers: 4
+  prefetch_factor: 2
+  use_amp: true
+  learning_rate: 0.0003               # Adam default for fine-tuning
+  optimizer: Adam
+  weight_decay: 0.0
+  scheduler: cosine
+  warmup_epochs: 3
+  val_split: 0.2
+  checkpoint_dir: ./checkpoints/ssd_mobilenetv3_paper
+  log_interval: 100
+  seed: 42
+  augmentation:
+    mosaic: 0.0
+    mixup: 0.0
+    horizontal_flip: true
+    vertical_flip: false
+    hsv_h: 0.0
+    hsv_s: 0.0
+    hsv_v: 0.0
+    scale: [1.0, 1.0]
+    translate: 0.0
+    random_iou_crop: false
+
+evaluation:
+  iou_thresholds: [0.5]
+  confidence_threshold: 0.25
+  confidence_thresholds_sweep:
+    [0.05, 0.10, 0.15, 0.20, 0.25, 0.30, 0.35, 0.40, 0.45, 0.50]
+
+output:
+  checkpoint_dir: ./checkpoints/ssd_mobilenetv3_paper
+  results_dir: ./checkpoints/ssd_mobilenetv3_paper
+  log_dir: ./logs/ssd_mobilenetv3_paper

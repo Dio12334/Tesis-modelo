@@ -309,6 +309,224 @@ class RandomTranslate:
         return f"RandomTranslate(translate={self.translate})"
 
 
+class RandomIoUCrop:
+    """SSD-style sample-IoU crop transform.
+
+    Re-implementation of the canonical SSD/SSDLite augmentation
+    (``torchvision.transforms.v2.RandomIoUCrop``) for the project's NumPy/cv2
+    augmentation pipeline. At each call:
+
+    1. Samples an option from ``min_jaccard_overlaps`` (None means "return
+       the original image unchanged"; ``1.0`` would mean "keep only crops
+       fully containing every box", which we exclude by default because it
+       devolves to a no-op on most road-damage scenes).
+    2. Tries up to ``trials`` random crops sized between ``min_scale`` and
+       ``max_scale`` of the input area with aspect ratio in ``aspect_ratio_range``.
+    3. Accepts a crop only when every retained bbox's **center** lies inside
+       the crop AND the crop's minimum IoU with the boxes meets the sampled
+       threshold.
+    4. On a successful crop, resizes back to the original (H, W) so the rest
+       of the pipeline stays size-stable.
+
+    All bboxes use normalised ``[x_min, y_min, x_max, y_max, ...]`` form.
+    Boxes whose centers fall outside the crop are dropped (matching the SSD
+    paper's recipe).
+
+    Args:
+        min_jaccard_overlaps: Sampling options. ``None`` is a no-op option;
+            float values are the minimum-IoU thresholds for the trial.
+            Defaults to the SSD paper's ``(None, 0.1, 0.3, 0.5, 0.7, 0.9)``.
+        trials: Maximum number of random crops attempted per sampled option.
+        aspect_ratio_range: Allowed crop aspect ratios (``w/h``).
+        min_scale: Minimum crop width/height as a fraction of the input
+            width/height.
+        max_scale: Maximum crop width/height as a fraction of the input
+            width/height.
+        p: Probability of applying the transform at all. ``p < 1`` lets the
+            caller mix the original image into the training stream.
+    """
+
+    DEFAULT_OPTIONS = (None, 0.1, 0.3, 0.5, 0.7, 0.9)
+
+    def __init__(
+        self,
+        min_jaccard_overlaps=DEFAULT_OPTIONS,
+        trials: int = 40,
+        aspect_ratio_range: Tuple[float, float] = (0.5, 2.0),
+        min_scale: float = 0.3,
+        max_scale: float = 1.0,
+        p: float = 1.0,
+    ):
+        if min_scale <= 0.0 or max_scale > 1.0 or min_scale > max_scale:
+            raise ValueError(
+                f"Invalid scale range ({min_scale}, {max_scale}); expect "
+                f"0 < min_scale <= max_scale <= 1."
+            )
+        if (
+            aspect_ratio_range[0] <= 0.0
+            or aspect_ratio_range[1] < aspect_ratio_range[0]
+        ):
+            raise ValueError(
+                f"Invalid aspect_ratio_range {aspect_ratio_range}; expect "
+                f"0 < lo <= hi."
+            )
+        self.options = tuple(min_jaccard_overlaps)
+        self.trials = int(trials)
+        self.aspect_lo, self.aspect_hi = (
+            float(aspect_ratio_range[0]),
+            float(aspect_ratio_range[1]),
+        )
+        self.min_scale = float(min_scale)
+        self.max_scale = float(max_scale)
+        self.p = float(p)
+
+    def __call__(self, image: Image, bboxes: BBoxes) -> Tuple[Image, BBoxes]:
+        # Probability gate: leave image untouched with prob (1 - p).
+        if random.random() >= self.p:
+            return image, bboxes
+
+        h, w = image.shape[:2]
+        if h <= 1 or w <= 1:
+            return image, bboxes
+
+        # SSD-style option sampling. ``None`` short-circuits to no-op.
+        mode = random.choice(self.options)
+        if mode is None:
+            return image, bboxes
+
+        # No-box edge case: random crop without IoU constraint.
+        if not bboxes:
+            crop = self._sample_crop(h, w)
+            if crop is None:
+                return image, bboxes
+            x1, y1, x2, y2 = crop
+            cropped = image[y1:y2, x1:x2]
+            cropped = cv2.resize(cropped, (w, h), interpolation=cv2.INTER_LINEAR)
+            return cropped, bboxes
+
+        # Convert normalised bboxes once to absolute pixel xyxy + centers for
+        # the IoU/center-in-crop checks.
+        boxes_px = np.array(
+            [[b[0] * w, b[1] * h, b[2] * w, b[3] * h] for b in bboxes],
+            dtype=np.float32,
+        )
+        centers_x = (boxes_px[:, 0] + boxes_px[:, 2]) * 0.5
+        centers_y = (boxes_px[:, 1] + boxes_px[:, 3]) * 0.5
+
+        for _ in range(self.trials):
+            crop = self._sample_crop(h, w)
+            if crop is None:
+                continue
+            x1, y1, x2, y2 = crop
+
+            # Filter boxes whose centers fall inside the crop (SSD recipe).
+            mask = (
+                (centers_x > x1)
+                & (centers_x < x2)
+                & (centers_y > y1)
+                & (centers_y < y2)
+            )
+            if not bool(mask.any()):
+                # Crop has no positives; reject and try another crop.
+                continue
+
+            kept = boxes_px[mask]
+            ious = _box_iou_per_pair(kept, np.array([[x1, y1, x2, y2]], dtype=np.float32))
+            if float(ious.min()) < float(mode):
+                # IoU threshold not satisfied for at least one kept box.
+                continue
+
+            # Crop accepted: clip surviving boxes to the crop window and
+            # remap to normalised coordinates of the (resized) crop.
+            kept[:, 0] = np.clip(kept[:, 0], x1, x2) - x1
+            kept[:, 1] = np.clip(kept[:, 1], y1, y2) - y1
+            kept[:, 2] = np.clip(kept[:, 2], x1, x2) - x1
+            kept[:, 3] = np.clip(kept[:, 3], y1, y2) - y1
+            crop_w = max(x2 - x1, 1)
+            crop_h = max(y2 - y1, 1)
+
+            new_bboxes: BBoxes = []
+            mask_list = mask.tolist()
+            kept_idx = 0
+            for keep, original in zip(mask_list, bboxes):
+                if not keep:
+                    continue
+                box = kept[kept_idx]
+                kept_idx += 1
+                new_bboxes.append([
+                    float(box[0]) / crop_w,
+                    float(box[1]) / crop_h,
+                    float(box[2]) / crop_w,
+                    float(box[3]) / crop_h,
+                ] + list(original[4:]))
+
+            cropped = image[y1:y2, x1:x2]
+            cropped = cv2.resize(cropped, (w, h), interpolation=cv2.INTER_LINEAR)
+            return cropped, _clip_and_filter_bboxes(new_bboxes)
+
+        # No accepted crop in ``trials`` attempts: return original (SSD default).
+        return image, bboxes
+
+    def _sample_crop(self, h: int, w: int):
+        """Sample one candidate crop window as (x1, y1, x2, y2) pixel ints.
+
+        Returns ``None`` if the sampled aspect ratio yields a window with
+        non-positive width or height (rare; happens at extreme aspect ratios
+        combined with small scales).
+        """
+        scale = random.uniform(self.min_scale, self.max_scale)
+        # Sample log-uniformly in aspect ratio so the distribution is
+        # symmetric in landscape vs portrait crops.
+        ar_lo = np.log(self.aspect_lo)
+        ar_hi = np.log(self.aspect_hi)
+        ar = float(np.exp(random.uniform(ar_lo, ar_hi)))
+
+        # Solve: cw * ch = scale^2 * w * h AND cw / ch = ar  (relative to
+        # the input frame). Result clipped to the input size to avoid edge
+        # cases where an extreme AR pushes either dimension above 1.0.
+        area = scale * scale * w * h
+        cw = int(round(np.sqrt(area * ar)))
+        ch = int(round(np.sqrt(area / ar)))
+        cw = min(cw, w)
+        ch = min(ch, h)
+        if cw < 2 or ch < 2:
+            return None
+
+        x1 = random.randint(0, w - cw)
+        y1 = random.randint(0, h - ch)
+        return x1, y1, x1 + cw, y1 + ch
+
+    def __repr__(self) -> str:
+        return (
+            f"RandomIoUCrop(options={self.options}, trials={self.trials}, "
+            f"aspect=({self.aspect_lo}, {self.aspect_hi}), "
+            f"scale=({self.min_scale}, {self.max_scale}), p={self.p})"
+        )
+
+
+def _box_iou_per_pair(boxes_a: np.ndarray, boxes_b: np.ndarray) -> np.ndarray:
+    """Vectorised IoU between every row of ``boxes_a`` and every row of ``boxes_b``.
+
+    Shapes: ``boxes_a`` (N, 4), ``boxes_b`` (M, 4) in xyxy. Returns (N, M).
+    """
+    if boxes_a.size == 0 or boxes_b.size == 0:
+        return np.zeros((boxes_a.shape[0], boxes_b.shape[0]), dtype=np.float32)
+    a = boxes_a[:, None, :]  # (N, 1, 4)
+    b = boxes_b[None, :, :]  # (1, M, 4)
+    inter_x1 = np.maximum(a[..., 0], b[..., 0])
+    inter_y1 = np.maximum(a[..., 1], b[..., 1])
+    inter_x2 = np.minimum(a[..., 2], b[..., 2])
+    inter_y2 = np.minimum(a[..., 3], b[..., 3])
+    inter_w = np.clip(inter_x2 - inter_x1, 0, None)
+    inter_h = np.clip(inter_y2 - inter_y1, 0, None)
+    inter = inter_w * inter_h
+    area_a = (a[..., 2] - a[..., 0]) * (a[..., 3] - a[..., 1])
+    area_b = (b[..., 2] - b[..., 0]) * (b[..., 3] - b[..., 1])
+    union = area_a + area_b - inter
+    iou = np.where(union > 0, inter / union, 0.0)
+    return iou.astype(np.float32)
+
+
 def build_augmentation_pipeline(config: dict) -> Compose:
     """Build a composed augmentation pipeline from a configuration dict.
 
@@ -322,6 +540,8 @@ def build_augmentation_pipeline(config: dict) -> Compose:
             hsv_v: 0.4              # value gain
             horizontal_flip: true
             brightness_range: [0.8, 1.2]  # ignored when HSV is active
+            random_iou_crop: true    # SSD-style sample-IoU crop; can also be
+                                     # a dict to override trials/scale/etc.
 
     Multi-image operations (mosaic, mixup) are handled at the Dataset level,
     not in this pipeline. Keys ``mosaic``, ``mixup``, ``mosaic_off_epochs``,
@@ -341,6 +561,31 @@ def build_augmentation_pipeline(config: dict) -> Compose:
         aug_config = config
 
     transforms: list = []
+
+    # SSD-style sample-IoU crop runs first because it changes both image
+    # content (a random crop is resized back to the input size) and bbox
+    # geometry. Downstream RandomScale/RandomTranslate then operate on the
+    # already-cropped frame, which is exactly the order torchvision's
+    # SSDLite pipeline uses.
+    iou_crop_cfg = aug_config.get("random_iou_crop", None)
+    if iou_crop_cfg:
+        if iou_crop_cfg is True:
+            transforms.append(RandomIoUCrop())
+        elif isinstance(iou_crop_cfg, dict):
+            transforms.append(RandomIoUCrop(
+                min_jaccard_overlaps=tuple(
+                    iou_crop_cfg.get(
+                        "min_jaccard_overlaps", RandomIoUCrop.DEFAULT_OPTIONS
+                    )
+                ),
+                trials=int(iou_crop_cfg.get("trials", 40)),
+                aspect_ratio_range=tuple(
+                    iou_crop_cfg.get("aspect_ratio_range", (0.5, 2.0))
+                ),
+                min_scale=float(iou_crop_cfg.get("min_scale", 0.3)),
+                max_scale=float(iou_crop_cfg.get("max_scale", 1.0)),
+                p=float(iou_crop_cfg.get("p", 1.0)),
+            ))
 
     # Scale (applied first — changes spatial layout)
     scale = aug_config.get("scale", None)

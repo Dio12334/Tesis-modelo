@@ -113,6 +113,48 @@ class BaseDetector(ABC):
         if hasattr(self, "_device"):
             self._device = device
 
+    def on_epoch_start(self, epoch: int) -> None:
+        """Optional hook invoked by the trainer at the start of every epoch.
+
+        Default implementation is a no-op. Subclasses can override this to
+        drive epoch-dependent schedules such as backbone freeze/unfreeze.
+
+        Args:
+            epoch: 0-indexed current epoch number.
+        """
+        return None
+
+    def requires_optimizer_rebuild(self) -> bool:
+        """Whether the trainer should rebuild the optimizer this epoch.
+
+        Wrappers that toggle ``requires_grad`` mid-training (e.g. to unfreeze
+        a backbone after N epochs) must set this flag to ``True`` so the
+        trainer can re-query :meth:`get_parameters` and construct a fresh
+        optimizer; PyTorch optimizers do not pick up newly-enabled parameters
+        once constructed. The default implementation returns ``False``.
+
+        The trainer reads the flag, rebuilds the optimizer when ``True``, and
+        then calls :meth:`acknowledge_optimizer_rebuild` to clear it.
+        """
+        return False
+
+    def acknowledge_optimizer_rebuild(self) -> None:
+        """Clear the optimizer-rebuild flag after the trainer has acted."""
+        return None
+
+    def supports_torch_compile(self) -> bool:
+        """Whether the trainer should wrap this model with ``torch.compile``.
+
+        Default ``True``: existing wrappers (Ultralytics-based YOLO26/RT-DETR)
+        benefit from compilation. Wrappers around models with heavy Python
+        control flow in their training-time forward (e.g. torchvision SSD,
+        whose transform path calls ``.item()`` and ``random.choice``) should
+        override this to return ``False`` to avoid graph-break recompilations.
+        The YAML key ``training.use_torch_compile`` takes precedence over this
+        default when set.
+        """
+        return True
+
 
 class ModelRegistry:
     """Singleton registry for detection model classes.
