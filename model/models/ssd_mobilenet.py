@@ -93,7 +93,11 @@ class SSDMobileNetV3(BaseDetector):
                 to implement a two-stage schedule that toggles ``requires_grad``
                 via :meth:`on_epoch_start`.
             confidence_threshold (float, optional):
-                Minimum score returned by :meth:`forward`. Default ``0.25``.
+                Operating-point score threshold used by **downstream consumers**
+                (inference CLI, P/R/F1 reporting). It is **not** applied inside
+                :meth:`forward` because doing so would discard predictions in
+                ``[score_threshold, confidence_threshold)`` that the mAP integral
+                and the F1 threshold sweep need. Default ``0.25``.
             iou_threshold / nms_threshold (float, optional):
                 IoU threshold for NMS inside the SSD postprocessor. Both names
                 are accepted (``iou_threshold`` is the cross-wrapper convention,
@@ -376,6 +380,15 @@ class SSDMobileNetV3(BaseDetector):
         tensors so callers can pass either an evaluation batch or the
         per-image lists that the trainer uses elsewhere.
 
+        Returned detections are filtered only by the SSD postprocessor's
+        ``score_threshold`` (low default 0.001 to support proper mAP
+        integration). ``confidence_threshold`` is **not** applied here: it
+        is the operating-point used by downstream P/R/F1 reporting and by
+        inference CLIs that post-filter detections; applying it inside
+        ``forward()`` would discard predictions in the
+        ``[score_threshold, confidence_threshold)`` band that the mAP
+        integral and the F1-threshold-sweep need.
+
         Args:
             images: Image tensor(s) with values already in ``[0, 1]``.
 
@@ -383,7 +396,6 @@ class SSDMobileNetV3(BaseDetector):
             List of dicts ``{"boxes", "labels", "scores"}`` per image. Boxes
             are in **xyxy pixel** coordinates of the input tensor. Labels are
             shifted back to 0-indexed class ids (matching the dataset adapter).
-            Detections below ``confidence_threshold`` are dropped.
         """
         # Ensure eval mode for inference (torchvision SSD returns losses in
         # train mode and detections in eval mode).
@@ -412,14 +424,6 @@ class SSDMobileNetV3(BaseDetector):
             boxes = output["boxes"]
             labels = output["labels"]
             scores = output["scores"]
-
-            # Drop low-confidence detections (independent of the postprocessor
-            # score_thresh, which we keep low for mAP integration).
-            if self.confidence_threshold > self.score_threshold and boxes.numel() > 0:
-                keep = scores >= self.confidence_threshold
-                boxes = boxes[keep]
-                labels = labels[keep]
-                scores = scores[keep]
 
             # Shift labels back to 0-indexed (torchvision returns 1..C+1; we
             # exported as 0..C from the dataset). Background (0) should never
