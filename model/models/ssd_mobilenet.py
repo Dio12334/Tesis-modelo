@@ -72,6 +72,7 @@ CONFIG_SCHEMA = {
     "backbone_lr": {"type": "float", "required": False},
     "head_lr": {"type": "float", "required": False},
     "freeze_backbone_epochs": {"type": "int", "required": False},
+    "load_coco_weights": {"type": "bool", "required": False},
 }
 
 
@@ -165,6 +166,15 @@ class SSDMobileNetV3(BaseDetector):
         self.freeze_backbone_epochs: int = int(
             config.get("freeze_backbone_epochs", 0)
         )
+        # Whether to initialise the detector from torchvision's COCO-pretrained
+        # SSDLite320 weights via selective state-dict transfer (backbone +
+        # bbox-regression head copy across; classification head is
+        # shape-incompatible and left at random init). Only meaningful at
+        # ``input_size == 320`` because torchvision ships official pretrained
+        # detector weights only for that variant.
+        self.load_coco_weights: bool = bool(
+            config.get("load_coco_weights", False)
+        )
         # Internal state: are backbone params currently frozen?
         self._backbone_frozen: bool = False
         # Flag the trainer reads to know it must rebuild the optimizer because
@@ -186,11 +196,12 @@ class SSDMobileNetV3(BaseDetector):
         logger.info(
             "Initialized SSDMobileNetV3 (input_size=%d, num_classes=%d, "
             "trainable_backbone_layers=%d, pretrained_backbone=%s, "
-            "freeze_backbone_epochs=%d, device=%s)",
+            "load_coco_weights=%s, freeze_backbone_epochs=%d, device=%s)",
             self.input_size,
             self.num_classes,
             self.trainable_backbone_layers,
             self.pretrained_backbone,
+            self.load_coco_weights,
             self.freeze_backbone_epochs,
             self._device,
         )
@@ -278,13 +289,41 @@ class SSDMobileNetV3(BaseDetector):
         weights_backbone = "DEFAULT" if self.pretrained_backbone else None
 
         if self.input_size == 320:
-            model = ssdlite320_mobilenet_v3_large(
-                weights=None,
-                weights_backbone=weights_backbone,
-                num_classes=num_classes_with_bg,
-                trainable_backbone_layers=self.trainable_backbone_layers,
-            )
+            if self.load_coco_weights:
+                # Build target with random head sized for our num_classes; the
+                # COCO backbone + bbox-regression head weights are loaded
+                # selectively below. The classification head is
+                # shape-incompatible (COCO has 91 classes, we have
+                # num_classes + background) and is left at random init.
+                model = ssdlite320_mobilenet_v3_large(
+                    weights=None,
+                    weights_backbone=None,
+                    num_classes=num_classes_with_bg,
+                    trainable_backbone_layers=self.trainable_backbone_layers,
+                )
+                # Reference COCO model with the canonical 91-class detection
+                # head. torchvision ships official pretrained weights only at
+                # 320x320; this is the only variant for which a true
+                # detector-level transfer is possible.
+                coco_model = ssdlite320_mobilenet_v3_large(weights="DEFAULT")
+                self._partial_load_state_dict(model, coco_model.state_dict())
+                del coco_model
+            else:
+                model = ssdlite320_mobilenet_v3_large(
+                    weights=None,
+                    weights_backbone=weights_backbone,
+                    num_classes=num_classes_with_bg,
+                    trainable_backbone_layers=self.trainable_backbone_layers,
+                )
         else:
+            if self.load_coco_weights:
+                logger.warning(
+                    "load_coco_weights=True is only supported at input_size=320 "
+                    "(torchvision ships SSDLite COCO weights only for the 320 "
+                    "variant). Falling back to ImageNet backbone-only "
+                    "initialisation for input_size=%d.",
+                    self.input_size,
+                )
             model = self._build_ssdlite_640(num_classes_with_bg, weights_backbone)
 
         # Override postprocessing parameters that the factory locks down. The
@@ -296,6 +335,65 @@ class SSDMobileNetV3(BaseDetector):
         model.topk_candidates = self.topk_candidates
 
         return model
+
+    @staticmethod
+    def _partial_load_state_dict(target_model, source_state_dict) -> None:
+        """Copy parameters from a source state-dict into a target model where
+        shapes match.
+
+        Used to transfer torchvision's COCO-pretrained SSDLite320 weights into
+        our target detector when ``num_classes`` differs (COCO has 91 classes,
+        RDD has 5 + 1 background). The backbone and bbox-regression head
+        transfer cleanly (identical shapes because both use the same
+        ``num_anchors_per_location`` pattern). The classification head is
+        shape-incompatible and is therefore skipped, leaving the target's
+        random initialisation in place. BatchNorm running statistics in the
+        backbone are also carried over.
+
+        Logs per-call statistics (transferred / shape-mismatched / missing)
+        and emits a WARNING if very few parameters transferred, which would
+        indicate an unexpected torchvision-version key-name change.
+        """
+        target_state = target_model.state_dict()
+        transferred = 0
+        skipped_shape = 0
+        missing = 0
+        sample_mismatches: list = []
+        for key, value in source_state_dict.items():
+            if key not in target_state:
+                missing += 1
+                continue
+            if target_state[key].shape != value.shape:
+                skipped_shape += 1
+                if len(sample_mismatches) < 5:
+                    sample_mismatches.append(
+                        f"{key} (target={tuple(target_state[key].shape)} "
+                        f"source={tuple(value.shape)})"
+                    )
+                continue
+            target_state[key] = value
+            transferred += 1
+        target_model.load_state_dict(target_state, strict=False)
+        logger.info(
+            "COCO transfer: %d params transferred, %d skipped (shape "
+            "mismatch), %d missing in target",
+            transferred,
+            skipped_shape,
+            missing,
+        )
+        if sample_mismatches:
+            logger.info(
+                "Sample shape-mismatch keys (expected: classification head):"
+                "\n  %s",
+                "\n  ".join(sample_mismatches),
+            )
+        if transferred < 100:
+            logger.warning(
+                "Only %d parameters transferred from COCO state dict -- "
+                "verify torchvision version compatibility (torchvision=%s).",
+                transferred,
+                torchvision.__version__,
+            )
 
     def _build_ssdlite_640(
         self,
