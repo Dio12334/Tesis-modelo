@@ -1,0 +1,91 @@
+name: rdd2022_ssd_mobilenetv3_320_coco
+
+# Canonical torchvision SSDLite320-MobileNetV3-Large baseline with COCO
+# transfer learning. Reference architecture:
+#   https://pytorch.org/vision/stable/models/generated/torchvision.models.detection.ssdlite320_mobilenet_v3_large.html
+#
+# Motivation: the previous SSD run (bf106015, input_size=640, ImageNet-only
+# backbone init, random detection head) hit F1=0.36 / mAP@0.5=0.295, vs the
+# Hasan & Ahmed (2024) paper's reported SSD+MobileNetV3 F1=0.56 on RDD-2022.
+# This run aligns with torchvision's *reference* SSDLite-320 implementation
+# and initialises the full detector (backbone + bbox-regression head) from
+# torchvision's official COCO-pretrained weights. The classification head is
+# shape-incompatible (COCO=91 classes vs RDD=5+background) and is
+# randomly initialised. See model/models/ssd_mobilenet.py
+# (_partial_load_state_dict) for the transfer logic.
+#
+# Deviations from bf106015:
+#   - input_size: 640 -> 320         (matches torchvision pretrained variant)
+#   - load_coco_weights: NEW=true    (full COCO detector transfer)
+#   - detections_per_image: 300 -> 200  (matches paper's "top 200" NMS)
+#   - topk_candidates:      300 -> 200  (matches paper)
+#   - freeze_backbone_epochs: 10 -> 3   (COCO init reduces need for head-only warmup)
+#   - batch_size: 32 retained (fits easily at 320^2)
+#   - seed=42 retained for split-reproducibility vs bf106015
+
+model:
+  type: ssd_mobilenetv3
+  config:
+    input_size: 320
+    num_classes: 5
+    pretrained_backbone: true
+    load_coco_weights: true
+    trainable_backbone_layers: 6
+    confidence_threshold: 0.25
+    score_threshold: 0.001
+    nms_threshold: 0.5
+    detections_per_image: 200
+    topk_candidates: 200
+    freeze_backbone_epochs: 3
+    backbone_lr: 0.0001
+    head_lr: 0.001
+
+dataset:
+  type: rdd2022
+  path: model/data/rdd2022/complete
+  class_mapping: model/configs/rdd2022_classes.yaml
+  country_filter:
+    - Japan
+    - India
+    - Czech
+    - United States
+
+training:
+  epochs: 100
+  early_stopping_patience: 15
+  batch_size: 32
+  num_workers: 8
+  prefetch_factor: 3
+  use_amp: true
+  use_channels_last: false
+  learning_rate: 0.001
+  optimizer: AdamW
+  weight_decay: 5.0e-5
+  scheduler: cosine
+  warmup_epochs: 3
+  val_split: 0.2
+  checkpoint_dir: ./checkpoints/ssd_mobilenetv3_320_coco
+  log_interval: 25
+  seed: 42
+  augmentation:
+    mosaic: 0.0
+    mixup: 0.0
+    horizontal_flip: true
+    vertical_flip: false
+    hsv_h: 0.015
+    hsv_s: 0.3
+    hsv_v: 0.3
+    scale: [0.75, 1.25]
+    translate: 0.05
+    random_iou_crop: true
+
+evaluation:
+  iou_thresholds: [0.5, 0.55, 0.6, 0.65, 0.7, 0.75, 0.8, 0.85, 0.9, 0.95]
+  confidence_threshold: 0.25
+  confidence_thresholds_sweep:
+    [0.05, 0.10, 0.15, 0.20, 0.25, 0.30, 0.35, 0.40, 0.45, 0.50]
+
+output:
+  checkpoint_dir: ./checkpoints/ssd_mobilenetv3_320_coco
+  results_dir: ./checkpoints/ssd_mobilenetv3_320_coco
+  log_dir: ./logs/ssd_mobilenetv3_320_coco
