@@ -535,6 +535,62 @@ def collate_fn(batch):
     return images, targets
 
 
+def _build_balanced_sampler(annotations, mode):
+    """Build a ``WeightedRandomSampler`` for class/country-balanced training.
+
+    ``mode`` is one of ``"class"``, ``"country"``, ``"both"``. Per-image weights use
+    a softened inverse image-frequency (``1/sqrt(n_images_with)``) so rare classes /
+    data-poor countries are oversampled without collapsing onto a handful of images:
+
+    - ``class``:   weight = max over the classes present in the image of
+      ``1/sqrt(n_img(class))``. Empty (negative) images get the most-common class's
+      weight, so negatives are still sampled at the baseline rate (they matter for
+      precision) rather than boosted.
+    - ``country``: weight = ``1/sqrt(n_img(country))``.
+    - ``both``:    product of the class and country weights.
+
+    Returns ``(sampler, stats)`` where ``stats`` is a dict for logging.
+    """
+    n = len(annotations)
+    class_img_count: dict = {}
+    country_img_count: dict = {}
+    img_classes = []
+    img_country = []
+    for ann in annotations:
+        classes = {bb.class_label for bb in ann.bounding_boxes}
+        img_classes.append(classes)
+        for c in classes:
+            class_img_count[c] = class_img_count.get(c, 0) + 1
+        country = ann.metadata.get("country") or "unknown"
+        img_country.append(country)
+        country_img_count[country] = country_img_count.get(country, 0) + 1
+
+    base_class_w = (1.0 / math.sqrt(max(class_img_count.values()))) if class_img_count else 1.0
+
+    def _cls_w(classes):
+        if not classes:
+            return base_class_w
+        return max(1.0 / math.sqrt(class_img_count[c]) for c in classes)
+
+    def _ctry_w(country):
+        return 1.0 / math.sqrt(country_img_count.get(country, 1))
+
+    weights = []
+    for i in range(n):
+        if mode == "class":
+            w = _cls_w(img_classes[i])
+        elif mode == "country":
+            w = _ctry_w(img_country[i])
+        else:  # both
+            w = _cls_w(img_classes[i]) * _ctry_w(img_country[i])
+        weights.append(w)
+
+    sampler = torch.utils.data.WeightedRandomSampler(
+        torch.as_tensor(weights, dtype=torch.double), num_samples=n, replacement=True
+    )
+    return sampler, {"class_img_count": class_img_count, "country_img_count": country_img_count}
+
+
 # -------------------------------------------------------------------------
 # Resume helpers
 # -------------------------------------------------------------------------
@@ -591,13 +647,19 @@ def _set_model_state_dict(model, state_dict):
 
 def _save_training_state(path, model, optimizer, scheduler, scaler, epoch,
                          best_val_loss, best_epoch, epochs_without_improvement,
-                         run_id, config_used):
-    """Save full training state (model + optimizer + scheduler + metadata) for resume."""
+                         run_id, config_used, ema=None):
+    """Save full training state (model + optimizer + scheduler + metadata) for resume.
+
+    Saves the *live* (raw) model weights here — resume must continue training the
+    raw trajectory, not the EMA shadow. The EMA shadow is stored separately under
+    ``ema_state_dict`` so it survives a resume too.
+    """
     state = {
         "model_state_dict": _get_model_state_dict(model),
         "optimizer_state_dict": optimizer.state_dict(),
         "scheduler_state_dict": scheduler.state_dict() if scheduler else None,
         "scaler_state_dict": scaler.state_dict() if scaler else None,
+        "ema_state_dict": ema.state_dict() if ema is not None else None,
         "epoch": epoch,
         "best_val_loss": best_val_loss,
         "best_epoch": best_epoch,
@@ -608,12 +670,14 @@ def _save_training_state(path, model, optimizer, scheduler, scaler, epoch,
     torch.save(state, str(path))
 
 
-def _load_training_state(path, model, optimizer, scheduler, scaler, device):
+def _load_training_state(path, model, optimizer, scheduler, scaler, device, ema=None):
     """Load training state; restore model/optimizer/scheduler. Returns metadata dict.
 
     Supports both new-format checkpoints (with optimizer/scheduler/scaler state) and
     old-format checkpoints (model weights only). When optimizer state is missing,
-    only model weights are loaded and a warning is logged.
+    only model weights are loaded and a warning is logged. The EMA shadow is
+    restored when present and ``ema`` is provided (older checkpoints simply keep
+    the freshly-initialised EMA).
     """
     state = torch.load(str(path), map_location=device)
     _set_model_state_dict(model, state["model_state_dict"])
@@ -624,6 +688,8 @@ def _load_training_state(path, model, optimizer, scheduler, scaler, device):
             scheduler.load_state_dict(state["scheduler_state_dict"])
         if scaler and state.get("scaler_state_dict"):
             scaler.load_state_dict(state["scaler_state_dict"])
+        if ema is not None and state.get("ema_state_dict"):
+            ema.load_state_dict(state["ema_state_dict"], device=device)
     else:
         logger.warning(
             "Checkpoint '%s' has no optimizer state (old format). "
@@ -637,6 +703,69 @@ def _load_training_state(path, model, optimizer, scheduler, scaler, device):
         state.setdefault("run_id", None)
 
     return state
+
+
+class ModelEMA:
+    """Exponential Moving Average of model weights (RT-DETR / Ultralytics recipe).
+
+    Keeps a shadow copy of the model's ``state_dict`` (with the ``torch.compile``
+    ``_orig_mod.`` prefix stripped, via ``_get_model_state_dict``), updated after
+    every optimizer step as ``v = d*v + (1-d)*w``. The decay ramps up so early
+    averages aren't dominated by the noisy initial weights:
+    ``d = base * (1 - exp(-updates / tau))``.
+
+    EMA weights generalise better than the final raw weights, so they are what
+    gets written to ``best_model.pt`` / ``final_model.pt`` for evaluation. The
+    shadow is GPU-resident (~weights size, e.g. ~130 MB for RT-DETR-L) and is
+    persisted in ``training_state.pt`` so resume continues the average.
+    """
+
+    def __init__(self, model, decay: float = 0.9999, tau: float = 2000.0):
+        self.shadow = {
+            k: v.detach().clone().float()
+            for k, v in _get_model_state_dict(model).items()
+        }
+        self.decay_base = float(decay)
+        self.tau = float(tau)
+        self.updates = 0
+
+    def _decay(self) -> float:
+        return self.decay_base * (1.0 - math.exp(-self.updates / self.tau))
+
+    @torch.no_grad()
+    def update(self, model) -> None:
+        """Update the shadow toward the current model weights (call after each step)."""
+        self.updates += 1
+        d = self._decay()
+        msd = _get_model_state_dict(model)
+        for k, sv in self.shadow.items():
+            mv = msd.get(k)
+            if mv is None:
+                continue
+            if sv.dtype.is_floating_point:
+                sv.mul_(d).add_(mv.detach().float(), alpha=1.0 - d)
+            else:
+                sv.copy_(mv)
+
+    def save(self, path) -> None:
+        """Write the EMA weights as ``{"model_state_dict": ...}`` (load_checkpoint-compatible)."""
+        Path(path).parent.mkdir(parents=True, exist_ok=True)
+        cpu_state = {k: v.detach().to("cpu") for k, v in self.shadow.items()}
+        torch.save({"model_state_dict": cpu_state}, str(path))
+
+    def state_dict(self) -> dict:
+        return {
+            "shadow": {k: v.detach().to("cpu") for k, v in self.shadow.items()},
+            "updates": self.updates,
+        }
+
+    def load_state_dict(self, sd, device=None) -> None:
+        shadow = sd.get("shadow", {})
+        self.shadow = {
+            k: (v.to(device) if device is not None else v).float()
+            for k, v in shadow.items()
+        }
+        self.updates = int(sd.get("updates", 0))
 
 
 def _resolve_resume_path(resume_from, checkpoint_dir, model_type):
@@ -730,6 +859,26 @@ def train(config_path: str, verbose: bool = False, resume_from: Optional[str] = 
     early_stopping_patience = training_config.get("early_stopping_patience", 15)
     use_channels_last = bool(training_config.get("use_channels_last", False))
     prefetch_factor = int(training_config.get("prefetch_factor", 2))
+    # How often to persist the full resume state (training_state.pt). Measured I/O
+    # cost is <0.2% of an epoch, so we default to every epoch: this gives crash-safe
+    # resume from the last completed epoch (important since a Windows Ctrl-C can kill
+    # the run mid-epoch). Raise it to reduce SSD writes if you don't need fine resume.
+    training_state_interval = max(1, int(training_config.get("training_state_interval", 1)))
+    # torch.compile only helps when a backend kernel compiler (triton) is available.
+    # On this Windows env triton is absent, so compile measured 0% gain (410.8 vs
+    # 411.5 ms/batch) while adding warmup/recompile overhead and CUDA-graph
+    # fragility. Default off; enable on a triton-capable setup (e.g. Linux).
+    use_torch_compile = bool(training_config.get("use_torch_compile", False))
+    # EMA (exponential moving average of weights). SOTA-standard for detection
+    # (RT-DETR uses decay 0.9999); generalises better and counters overfitting.
+    # Opt-in: best/final checkpoints are saved from the EMA shadow when enabled.
+    use_ema = bool(training_config.get("use_ema", False))
+    ema_decay = float(training_config.get("ema_decay", 0.9999))
+    ema_tau = float(training_config.get("ema_tau", 2000.0))
+    # Class/country-balanced sampling: "off" (default), "class", "country", "both".
+    # Oversamples images with rare classes / from data-poor countries to fight the
+    # imbalance (e.g. pothole/other, Czech). See _build_balanced_sampler.
+    balanced_sampling = str(training_config.get("balanced_sampling", "off")).lower()
 
     # Reproducibility seed
     seed = training_config.get("seed", 42)
@@ -807,8 +956,9 @@ def train(config_path: str, verbose: bool = False, resume_from: Optional[str] = 
         except Exception as e:
             logger.warning("channels_last conversion failed, continuing in default layout: %s", e)
 
-    # Compile model for faster CUDA execution (torch.compile, requires PyTorch 2.0+)
-    if hasattr(torch, "compile") and device.type == "cuda":
+    # Compile model for faster CUDA execution (torch.compile, requires PyTorch 2.0+
+    # AND a triton backend). Opt-in: measured no benefit without triton on this env.
+    if use_torch_compile and hasattr(torch, "compile") and device.type == "cuda":
         try:
             if hasattr(model, "_model") and hasattr(model._model, "model"):
                 model._model.model = torch.compile(model._model.model, mode="reduce-overhead")
@@ -849,6 +999,17 @@ def train(config_path: str, verbose: bool = False, resume_from: Optional[str] = 
     )
     val_torch = RDD2022TorchDataset(val_ds, input_size=input_size)  # No augmentation for validation
 
+    # --- Class/country-balanced sampling (optional) ---
+    train_sampler = None
+    if balanced_sampling in ("class", "country", "both"):
+        train_sampler, _bal_stats = _build_balanced_sampler(
+            train_torch._annotations, balanced_sampling
+        )
+        logger.info(
+            "Balanced sampling = '%s' | images/class=%s | images/country=%s",
+            balanced_sampling, _bal_stats["class_img_count"], _bal_stats["country_img_count"],
+        )
+
     # On Windows, DataLoader workers require explicit spawn context
     is_windows = platform.system() == "Windows"
     effective_workers = num_workers
@@ -861,12 +1022,18 @@ def train(config_path: str, verbose: bool = False, resume_from: Optional[str] = 
     train_loader = torch.utils.data.DataLoader(
         train_torch,
         batch_size=batch_size,
-        shuffle=True,
+        shuffle=train_sampler is None,   # shuffle XOR sampler (PyTorch forbids both)
+        sampler=train_sampler,
         num_workers=effective_workers,
         pin_memory=True,
         persistent_workers=effective_workers > 0,
         multiprocessing_context=mp_context,
         collate_fn=collate_fn,
+        # Drop the ragged final batch so every step has a fixed batch dimension.
+        # This keeps torch.compile / CUDA-graph captures from re-tracing on the
+        # last (smaller) batch each epoch, and avoids BatchNorm on a tiny batch.
+        # Cost: up to batch_size-1 images skipped per epoch (~0.03% of train).
+        drop_last=True,
         **prefetch_kwargs,
     )
     val_loader = torch.utils.data.DataLoader(
@@ -938,6 +1105,17 @@ def train(config_path: str, verbose: bool = False, resume_from: Optional[str] = 
     else:
         logger.info("Mixed precision training (AMP) disabled, using full precision")
 
+    # --- EMA (exponential moving average of weights) ---
+    # Created from the (device-resident) model so the shadow lives on the same
+    # device. Must exist before the resume block so its shadow can be restored.
+    ema = None
+    if use_ema:
+        ema = ModelEMA(model, decay=ema_decay, tau=ema_tau)
+        logger.info(
+            "EMA enabled (decay=%.5f, tau=%.0f); best/final checkpoints use EMA weights",
+            ema_decay, ema_tau,
+        )
+
     # --- SIGINT handling ---
     interrupted = False
     original_sigint_handler = signal.getsignal(signal.SIGINT)
@@ -968,6 +1146,17 @@ def train(config_path: str, verbose: bool = False, resume_from: Optional[str] = 
         else:
             model.save_checkpoint(path)
 
+    def _save_eval_checkpoint(path: Path, optimizer_obj=None, epoch_num=None, metrics_dict=None):
+        """Save the checkpoint used for inference/eval (best/recovery/final).
+
+        Uses the EMA shadow weights when EMA is enabled (they generalise better);
+        otherwise falls back to the live model weights via ``_save_checkpoint``.
+        """
+        if ema is not None:
+            ema.save(path)
+        else:
+            _save_checkpoint(path, optimizer_obj=optimizer_obj, epoch_num=epoch_num, metrics_dict=metrics_dict)
+
     # --- Resume handling ---
     start_epoch = 0
     best_val_loss = float("inf")
@@ -978,7 +1167,7 @@ def train(config_path: str, verbose: bool = False, resume_from: Optional[str] = 
         try:
             resume_path = _resolve_resume_path(resume_from, checkpoint_dir, model_type)
             logger.info("Loading resume state from: %s", resume_path)
-            state = _load_training_state(resume_path, model, optimizer, cosine_scheduler, scaler, device)
+            state = _load_training_state(resume_path, model, optimizer, cosine_scheduler, scaler, device, ema)
             run_id = state.get("run_id")
             if run_id:
                 start_epoch = state["epoch"] + 1
@@ -1044,9 +1233,15 @@ def train(config_path: str, verbose: bool = False, resume_from: Optional[str] = 
             train_batches = 0
 
             for batch_idx, (images, targets) in enumerate(train_loader):
-                # Move data to device
-                images = [img.to(device) for img in images]
-                targets = [{k: v.to(device) for k, v in t.items()} for t in targets]
+                # Stop promptly once a SIGINT has been received, before fetching more
+                # batches (on Windows that fetch can raise if the workers were killed).
+                if interrupted:
+                    break
+                # Move data to device. non_blocking=True overlaps the H2D copy with
+                # compute (the loaders use pin_memory=True), instead of blocking on
+                # each transfer. Negligible here while compute-bound, but free.
+                images = [img.to(device, non_blocking=True) for img in images]
+                targets = [{k: v.to(device, non_blocking=True) for k, v in t.items()} for t in targets]
 
                 optimizer.zero_grad()
 
@@ -1084,6 +1279,10 @@ def train(config_path: str, verbose: bool = False, resume_from: Optional[str] = 
                 scaler.step(optimizer)
                 scaler.update()
 
+                # Update EMA shadow after the weights changed
+                if ema is not None:
+                    ema.update(model)
+
                 train_loss_sum += loss_tensor.item()
                 train_batches += 1
 
@@ -1102,6 +1301,14 @@ def train(config_path: str, verbose: bool = False, resume_from: Optional[str] = 
             # Compute epoch training metrics
             avg_train_loss = train_loss_sum / max(train_batches, 1)
 
+            # On interrupt, stop before validation/checkpointing: the val DataLoader
+            # workers may already be dead (SIGINT kills spawn workers) and a partial
+            # validation would yield a misleading val_loss / false "best". Resume uses
+            # the previous epoch's training_state.pt (now saved every epoch).
+            if interrupted:
+                logger.info("Interrupted during epoch %d; stopping before validation.", epoch + 1)
+                break
+
             # --- Validation phase ---
             model.set_eval_mode()
             val_loss_sum = 0.0
@@ -1109,8 +1316,8 @@ def train(config_path: str, verbose: bool = False, resume_from: Optional[str] = 
 
             with torch.no_grad():
                 for images, targets in val_loader:
-                    images = [img.to(device) for img in images]
-                    targets = [{k: v.to(device) for k, v in t.items()} for t in targets]
+                    images = [img.to(device, non_blocking=True) for img in images]
+                    targets = [{k: v.to(device, non_blocking=True) for k, v in t.items()} for t in targets]
 
                     try:
                         loss_dict = model.train_step(images, targets)
@@ -1160,7 +1367,7 @@ def train(config_path: str, verbose: bool = False, resume_from: Optional[str] = 
                 best_epoch = epoch + 1  # 1-indexed
                 epochs_without_improvement = 0
                 try:
-                    _save_checkpoint(
+                    _save_eval_checkpoint(
                         run_checkpoint_dir / "best_model.pt",
                         optimizer_obj=optimizer,
                         epoch_num=epoch,
@@ -1175,7 +1382,7 @@ def train(config_path: str, verbose: bool = False, resume_from: Optional[str] = 
             # Recovery checkpoint: every 5 epochs (1-indexed, so epoch+1 % 5 == 0)
             if (epoch + 1) % 5 == 0:
                 try:
-                    _save_checkpoint(
+                    _save_eval_checkpoint(
                         run_checkpoint_dir / "recovery.pt",
                         optimizer_obj=optimizer,
                         epoch_num=epoch,
@@ -1185,16 +1392,26 @@ def train(config_path: str, verbose: bool = False, resume_from: Optional[str] = 
                 except (IOError, OSError) as e:
                     logger.warning("Failed to save recovery checkpoint: %s", e)
 
-            # Training state (always, for resume): overwritten each epoch
-            try:
-                _save_training_state(
-                    run_checkpoint_dir / "training_state.pt",
-                    model, optimizer, cosine_scheduler, scaler,
-                    epoch, best_val_loss, best_epoch, epochs_without_improvement,
-                    run_id, config,
-                )
-            except (IOError, OSError) as e:
-                logger.warning("Failed to save training state: %s", e)
+            # Training state (for resume): written every `training_state_interval`
+            # epochs, plus on the last epoch, on early-stop, and on interrupt. The
+            # file is ~286 MB for RT-DETR; writing it every epoch previously stalled
+            # the GPU on synchronous I/O for no benefit while compute-bound.
+            should_save_state = (
+                (epoch + 1) % training_state_interval == 0
+                or (epoch + 1) == epochs
+                or interrupted
+                or epochs_without_improvement >= early_stopping_patience
+            )
+            if should_save_state:
+                try:
+                    _save_training_state(
+                        run_checkpoint_dir / "training_state.pt",
+                        model, optimizer, cosine_scheduler, scaler,
+                        epoch, best_val_loss, best_epoch, epochs_without_improvement,
+                        run_id, config, ema,
+                    )
+                except (IOError, OSError) as e:
+                    logger.warning("Failed to save training state: %s", e)
 
             # --- Early stopping check ---
             if epochs_without_improvement >= early_stopping_patience:
@@ -1213,6 +1430,17 @@ def train(config_path: str, verbose: bool = False, resume_from: Optional[str] = 
     except KeyboardInterrupt:
         # Second SIGINT caused immediate termination
         logger.warning("Training forcefully interrupted (double SIGINT)")
+
+    except RuntimeError as e:
+        # On Windows, Ctrl-C kills the DataLoader (spawn) workers, which surfaces here
+        # as "DataLoader worker exited unexpectedly" from the batch fetch. Treat it as
+        # a graceful stop when we're already interrupting; re-raise genuine errors
+        # (e.g. CUDA OOM) so they still surface. The last completed epoch's
+        # training_state.pt (saved every epoch) is the resume point.
+        if interrupted:
+            logger.info("Training stopped after interrupt (DataLoader workers exited).")
+        else:
+            raise
 
     finally:
         # --- End experiment tracking (always, even on interrupt/crash) ---
@@ -1237,7 +1465,7 @@ def train(config_path: str, verbose: bool = False, resume_from: Optional[str] = 
         "val_loss": avg_val_loss,
     }
     try:
-        _save_checkpoint(
+        _save_eval_checkpoint(
             run_checkpoint_dir / "final_model.pt",
             optimizer_obj=optimizer,
             epoch_num=completed_epochs - 1 if completed_epochs > 0 else 0,

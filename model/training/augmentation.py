@@ -309,6 +309,52 @@ class RandomTranslate:
         return f"RandomTranslate(translate={self.translate})"
 
 
+class RandomErasing:
+    """Randomly blanks out a rectangular region (Cutout / Random Erasing).
+
+    Regularisation transform: with probability ``p``, fills a random rectangle
+    covering a fraction ``scale`` of the image area (aspect ratio in ``ratio``)
+    with grey (114) — the same fill mosaic/letterbox uses, so it reads as an
+    occlusion, not a colour artefact. Bounding boxes are left untouched on
+    purpose: occluding part of a crack/pothole teaches robustness to occlusion
+    and the object largely remains. No geometric distortion → safe for
+    orientation-sensitive road imagery.
+
+    Args:
+        p: Probability of applying the erase.
+        scale: (min, max) fraction of image area to erase.
+        ratio: (min, max) aspect ratio (w/h) of the erased rectangle.
+        value: Fill value (grey 114 by default).
+    """
+
+    def __init__(self, p: float = 0.3, scale: Tuple[float, float] = (0.02, 0.2),
+                 ratio: Tuple[float, float] = (0.3, 3.3), value: int = 114):
+        self.p = p
+        self.scale = scale
+        self.ratio = ratio
+        self.value = value
+
+    def __call__(self, image: Image, bboxes: BBoxes) -> Tuple[Image, BBoxes]:
+        if random.random() >= self.p:
+            return image, bboxes
+        h, w = image.shape[:2]
+        area = h * w
+        for _ in range(10):  # a few attempts to fit a valid rectangle
+            target_area = random.uniform(self.scale[0], self.scale[1]) * area
+            ar = random.uniform(self.ratio[0], self.ratio[1])
+            eh = int(round((target_area * ar) ** 0.5))
+            ew = int(round((target_area / ar) ** 0.5))
+            if 0 < eh < h and 0 < ew < w:
+                y = random.randint(0, h - eh)
+                x = random.randint(0, w - ew)
+                image[y:y + eh, x:x + ew] = self.value
+                break
+        return image, bboxes
+
+    def __repr__(self) -> str:
+        return f"RandomErasing(p={self.p}, scale={self.scale}, ratio={self.ratio})"
+
+
 def build_augmentation_pipeline(config: dict) -> Compose:
     """Build a composed augmentation pipeline from a configuration dict.
 
@@ -379,5 +425,11 @@ def build_augmentation_pipeline(config: dict) -> Compose:
         if brightness_range is not None:
             if isinstance(brightness_range, (list, tuple)) and len(brightness_range) == 2:
                 transforms.append(RandomBrightness(brightness_range=tuple(brightness_range)))
+
+    # Random erasing / cutout (regularisation; image-only, applied LAST so it
+    # occludes the final composed image). Accepts ``random_erasing`` or ``erasing_p``.
+    erasing_p = aug_config.get("random_erasing", aug_config.get("erasing_p", 0.0))
+    if erasing_p is not None and float(erasing_p) > 0:
+        transforms.append(RandomErasing(p=float(erasing_p)))
 
     return Compose(transforms)

@@ -2127,6 +2127,18 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help="Directory to save evaluation report and predictions",
     )
     parser.add_argument(
+        "--tta",
+        action="store_true",
+        help="Enable test-time augmentation (horizontal flip + multi-scale) at inference.",
+    )
+    parser.add_argument(
+        "--tta-scales",
+        type=float,
+        nargs="+",
+        default=None,
+        help="Scales for TTA, e.g. --tta-scales 0.83 1.0 1.17 (default: 1.0).",
+    )
+    parser.add_argument(
         "--verbose",
         "-v",
         action="store_true",
@@ -2209,6 +2221,11 @@ def main() -> None:
         overrides.setdefault("evaluation", {})["confidence_threshold"] = args.confidence
     if args.iou is not None:
         overrides.setdefault("evaluation", {})["iou_threshold"] = args.iou
+    if args.tta:
+        _mc = overrides.setdefault("model", {}).setdefault("config", {})
+        _mc["tta"] = True
+        if args.tta_scales:
+            _mc["tta_scales"] = args.tta_scales
     if args.output_dir:
         overrides.setdefault("evaluation", {})["output_dir"] = args.output_dir
 

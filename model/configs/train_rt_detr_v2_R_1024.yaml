@@ -1,0 +1,96 @@
+name: rdd2022_rt_detr_l_v2_R_1024
+
+# Copia del mejor config de entrenamiento (train_rt_detr_v2_R.yaml = R, mAP@0.5 0.642)
+# con la IMAGEN AUMENTADA, para correr en EC2 (Ubuntu, ~25 GB VRAM, 8 vCPU, 36 GB RAM).
+# ÚNICOS cambios vs R (todo lo demás idéntico: S1 loss, S5 LR discr., EMA, weight_decay 5e-4,
+# random_erasing):
+#   input_size  768 -> 1024   (más resolución para objetos pequeños / bache; lo que más ayudó fue S2)
+#   batch_size    6 -> 8      (aprovecha los ~25 GB de VRAM; bajar a 4-6 si OOM, o probar 12 si sobra)
+#   num_workers   4 -> 8      (8 vCPU en la EC2)
+#   prefetch_factor 2 -> 4
+# Hipótesis: 1024 sube la AP de objetos pequeños (bache/grietas finas) por encima de 0.642.
+#
+# Notas para la EC2 (Linux):
+#  - triton SÍ está disponible en Linux (viene con torch), así que torch.compile PODRÍA funcionar.
+#    Pero en nuestras mediciones compile no aceleró RT-DETR ni con triton (shapes dinámicos del
+#    decoder rompen el grafo). Dejar use_torch_compile en false; si quieres, probarlo y medir con
+#    `python -m model.tools.profile_compute_variants --config <este yaml>` antes de fiarte.
+#  - NO activar channels_last (medido 2.2x más lento con RT-DETR).
+#  - Verificar la ruta del dataset (`dataset.path`) en la EC2.
+
+model:
+  type: rt_detr
+  config:
+    model_size: "l"
+    input_size: 1024           # << aumentado (era 768)
+    num_classes: 5
+    confidence_threshold: 0.5
+    iou_threshold: 0.5
+    backbone_layers: 10
+    backbone_lr: 0.00001       # S5
+    head_lr: 0.0001            # S5
+
+dataset:
+  type: rdd2022
+  path: model/data/rdd2022/    # << ajustar a la ruta del dataset en la EC2
+  class_mapping: model/configs/rdd2022_classes.yaml
+  country_filter: [Japan, India, United_States, Czech]
+
+training:
+  epochs: 40
+  early_stopping_patience: 12
+  batch_size: 8                # << aumentado (era 6); ajustar según VRAM
+  num_workers: 8               # << 8 vCPU
+  prefetch_factor: 4
+  use_amp: true
+  use_torch_compile: false     # Linux tiene triton, pero compile no ayudó a RT-DETR; medir antes
+  learning_rate: 0.0001
+  optimizer: AdamW
+  weight_decay: 0.0005         # R
+  momentum: 0.937
+  scheduler: cosine
+  warmup_epochs: 3
+  val_split: 0.2
+  checkpoint_dir: ./checkpoints/rt_detr_v2_R_1024
+  log_interval: 10
+  seed: 42
+
+  use_ema: true
+  ema_decay: 0.9999
+  ema_tau: 2000
+
+  early_stopping_metric: map
+  eval_interval: 5
+
+  loss:
+    focal_loss: true
+    focal_gamma: 2.0
+    focal_alpha: 0.25          # S1
+    no_object_weight: 0.1      # S1
+    class_weight: 1.0
+    bbox_weight: 5.0
+    giou_weight: 2.0
+
+  augmentation:
+    horizontal_flip: true
+    mosaic: 0.0
+    mixup: 0.0
+    mosaic_off_epochs: 0
+    hsv_h: 0.015
+    hsv_s: 0.5
+    hsv_v: 0.4
+    scale: [0.8, 1.2]
+    translate: 0.1
+    random_erasing: 0.3        # R
+
+evaluation:
+  iou_thresholds: [0.25, 0.5, 0.75]
+  confidence_threshold: 0.5
+  confidence_thresholds_sweep:
+    [0.05, 0.10, 0.15, 0.20, 0.25, 0.30, 0.35, 0.40, 0.45, 0.50,
+     0.55, 0.60, 0.65, 0.70, 0.75, 0.80, 0.85, 0.90, 0.95, 1.00]
+
+output:
+  checkpoint_dir: ./checkpoints/rt_detr_v2_R_1024
+  results_dir: ./results/rt_detr_v2_R_1024
+  log_dir: ./logs/rt_detr_v2_R_1024

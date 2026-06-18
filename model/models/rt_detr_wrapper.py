@@ -74,6 +74,12 @@ class RT_DETR_Detector(BaseDetector):
         self._backbone_lr: Optional[float] = config.get("backbone_lr")
         self._head_lr: Optional[float] = config.get("head_lr")
         self._backbone_layers: int = config.get("backbone_layers", 10)
+        # Test-time augmentation (inference only): run the detector on several
+        # flipped/rescaled views and merge with NMS. ultralytics' augment=True is a
+        # no-op for RT-DETR, so we implement it in forward() (see _forward_tta).
+        self._tta: bool = bool(config.get("tta", False))
+        self._tta_scales = list(config.get("tta_scales", [1.0]))
+        self._tta_flip: bool = bool(config.get("tta_flip", True))
 
         # Initialize the model
         self._device: Optional[Any] = None
@@ -644,6 +650,9 @@ class RT_DETR_Detector(BaseDetector):
         """
         device = images.device
 
+        if self._tta:
+            return self._forward_tta(images)
+
         results = self._model.predict(
             images,
             conf=self.confidence_threshold,
@@ -652,6 +661,81 @@ class RT_DETR_Detector(BaseDetector):
         )
 
         return self._convert_results(results, device)
+
+    def _forward_tta(self, images: "torch.Tensor") -> List[dict]:
+        """Test-time augmentation forward pass.
+
+        Runs the detector on the original image plus horizontally-flipped and/or
+        rescaled views, maps every detection back to the input (``input_size``)
+        pixel space, and merges them per image with class-wise NMS. This trades
+        ``len(views)`` forward passes for higher recall/mAP. RT-DETR is NMS-free in
+        single-view inference, but TTA must dedup the overlapping detections that
+        the same object produces across views, hence the merge NMS.
+        """
+        import torch.nn.functional as F
+        from torchvision.ops import batched_nms
+
+        device = images.device
+        _, _, H, W = images.shape
+
+        views = [(float(s), False) for s in self._tta_scales]
+        if self._tta_flip:
+            views += [(float(s), True) for s in self._tta_scales]
+
+        batch = images.shape[0]
+        acc = [{"boxes": [], "labels": [], "scores": []} for _ in range(batch)]
+        for scale, flip in views:
+            view = images
+            if flip:
+                view = torch.flip(view, dims=[3])  # horizontal flip
+            if scale != 1.0:
+                # round to a multiple of 32 (RT-DETR / transformer stride requirement)
+                nh = max(32, int(round(H * scale / 32)) * 32)
+                nw = max(32, int(round(W * scale / 32)) * 32)
+                view = F.interpolate(view, size=(nh, nw), mode="bilinear", align_corners=False)
+            vh, vw = view.shape[2], view.shape[3]
+
+            preds = self._convert_results(
+                self._model.predict(view, conf=self.confidence_threshold,
+                                    iou=self.iou_threshold, verbose=False),
+                device,
+            )
+            for i, p in enumerate(preds):
+                boxes = p["boxes"]
+                if boxes.numel() == 0:
+                    continue
+                boxes = boxes.clone()
+                # undo scale: view pixels -> input_size (W,H) pixels
+                if scale != 1.0:
+                    boxes[:, [0, 2]] *= (W / vw)
+                    boxes[:, [1, 3]] *= (H / vh)
+                # undo horizontal flip: x -> W - x (swap x1,x2)
+                if flip:
+                    x1 = boxes[:, 0].clone()
+                    x2 = boxes[:, 2].clone()
+                    boxes[:, 0] = W - x2
+                    boxes[:, 2] = W - x1
+                acc[i]["boxes"].append(boxes)
+                acc[i]["labels"].append(p["labels"])
+                acc[i]["scores"].append(p["scores"])
+
+        out: List[dict] = []
+        for i in range(batch):
+            if not acc[i]["boxes"]:
+                out.append({
+                    "boxes": torch.zeros((0, 4), dtype=torch.float32, device=device),
+                    "labels": torch.zeros((0,), dtype=torch.int64, device=device),
+                    "scores": torch.zeros((0,), dtype=torch.float32, device=device),
+                })
+                continue
+            boxes = torch.cat(acc[i]["boxes"], dim=0)
+            labels = torch.cat(acc[i]["labels"], dim=0)
+            scores = torch.cat(acc[i]["scores"], dim=0)
+            keep = batched_nms(boxes, scores, labels, self.iou_threshold)
+            out.append({
+                "boxes": boxes[keep], "labels": labels[keep], "scores": scores[keep],
+            })
+        return out
 
     def _convert_results(
         self, results: list, device: "torch.device"
