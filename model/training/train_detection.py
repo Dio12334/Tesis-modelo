@@ -31,6 +31,14 @@ import numpy as np
 
 from model.config.manager import ConfigManager
 from model.training.augmentation import build_augmentation_pipeline
+from model.training.ema import (
+    create_ema,
+    update_ema,
+    ema_weights,
+    ema_eval_model,
+    ema_state_dict,
+    load_ema_state,
+)
 from model.datasets.rdd2022 import RDD2022Dataset
 from model.models import ModelRegistry
 from model.exceptions import ModelNotFoundError, ConfigurationError
@@ -591,7 +599,7 @@ def _set_model_state_dict(model, state_dict):
 
 def _save_training_state(path, model, optimizer, scheduler, scaler, epoch,
                          best_val_loss, best_epoch, epochs_without_improvement,
-                         run_id, config_used):
+                         run_id, config_used, ema=None, best_map=None):
     """Save full training state (model + optimizer + scheduler + metadata) for resume."""
     state = {
         "model_state_dict": _get_model_state_dict(model),
@@ -604,11 +612,18 @@ def _save_training_state(path, model, optimizer, scheduler, scaler, epoch,
         "epochs_without_improvement": epochs_without_improvement,
         "run_id": run_id,
         "config_used": config_used,
+        # EMA weights + averaged-update count, so resume continues the moving
+        # average instead of re-seeding it from the resumed live weights.
+        "ema_state_dict": ema_state_dict(ema),
+        "ema_updates": getattr(ema, "updates", None) if ema is not None else None,
+        # Best mAP for map_50-based checkpoint selection (None when selecting
+        # on val_loss).
+        "best_map": best_map,
     }
     torch.save(state, str(path))
 
 
-def _load_training_state(path, model, optimizer, scheduler, scaler, device):
+def _load_training_state(path, model, optimizer, scheduler, scaler, device, ema=None):
     """Load training state; restore model/optimizer/scheduler. Returns metadata dict.
 
     Supports both new-format checkpoints (with optimizer/scheduler/scaler state) and
@@ -617,6 +632,9 @@ def _load_training_state(path, model, optimizer, scheduler, scaler, device):
     """
     state = torch.load(str(path), map_location=device)
     _set_model_state_dict(model, state["model_state_dict"])
+
+    # Restore the EMA moving average if present (new-format checkpoints only).
+    load_ema_state(ema, state.get("ema_state_dict"), state.get("ema_updates"))
 
     if "optimizer_state_dict" in state:
         optimizer.load_state_dict(state["optimizer_state_dict"])
@@ -636,7 +654,61 @@ def _load_training_state(path, model, optimizer, scheduler, scaler, device):
         state.setdefault("epochs_without_improvement", 0)
         state.setdefault("run_id", None)
 
+    state.setdefault("best_map", None)
     return state
+
+
+def _evaluate_val_map(model, ema, val_loader, num_classes, eval_conf, device):
+    """Compute mAP@0.5 on the val split using the EMA weights.
+
+    Reuses the existing ``val_loader`` (images already resized to the model's
+    input size, so inputs are stride-divisible) and runs inference on a
+    fusion-isolated deep copy of the model holding the EMA weights. Boxes from
+    predictions and targets are both in the same input-size pixel space; IoU is
+    scale-invariant, so no coordinate normalisation is required.
+
+    Returns the mAP@0.5 as a float (0.0 if no usable predictions/targets).
+    """
+    from model.evaluation.metrics import compute_map
+
+    predictions = []
+    ground_truths = []
+    img_id = 0
+
+    with ema_eval_model(model, ema):
+        # Lower the confidence floor during eval so the precision-recall curve
+        # is not truncated (mirrors the offline evaluator's low-conf inference).
+        prev_conf = getattr(model, "confidence_threshold", None)
+        try:
+            if prev_conf is not None:
+                model.confidence_threshold = min(prev_conf, 0.01)
+            with torch.no_grad():
+                for images, targets in val_loader:
+                    batch = torch.stack([img.to(device) for img in images])
+                    results = model.forward(batch)
+                    for res, tgt in zip(results, targets):
+                        predictions.append({
+                            "image_id": img_id,
+                            "boxes": res["boxes"].detach().cpu().tolist(),
+                            "labels": [int(x) for x in res["labels"].detach().cpu().tolist()],
+                            "scores": [float(x) for x in res["scores"].detach().cpu().tolist()],
+                        })
+                        ground_truths.append({
+                            "image_id": img_id,
+                            "boxes": tgt["boxes"].detach().cpu().tolist(),
+                            "labels": [int(x) for x in tgt["labels"].detach().cpu().tolist()],
+                        })
+                        img_id += 1
+        finally:
+            if prev_conf is not None:
+                model.confidence_threshold = prev_conf
+
+    present = sorted({l for gt in ground_truths for l in gt["labels"]})
+    class_names = present if present else list(range(num_classes))
+    result = compute_map(
+        predictions, ground_truths, iou_thresholds=[0.5], class_names=class_names
+    )
+    return float(result["map_50"])
 
 
 def _resolve_resume_path(resume_from, checkpoint_dir, model_type):
@@ -730,6 +802,20 @@ def train(config_path: str, verbose: bool = False, resume_from: Optional[str] = 
     early_stopping_patience = training_config.get("early_stopping_patience", 15)
     use_channels_last = bool(training_config.get("use_channels_last", False))
     prefetch_factor = int(training_config.get("prefetch_factor", 2))
+
+    # --- Checkpoint-selection metric ---
+    # "val_loss" (default, backward compatible): best = min validation loss.
+    # "map_50": best = max mAP@0.5 measured on the val split using EMA weights;
+    # this matches how the model is ultimately evaluated and avoids the
+    # loss-vs-mAP mismatch. Periodic to bound the extra inference cost.
+    checkpoint_metric = str(
+        training_config.get("checkpoint_metric", "val_loss")
+    ).lower()
+    use_map_selection = checkpoint_metric in ("map", "map_50", "map50")
+    eval_interval = max(1, int(training_config.get("eval_interval", 1)))
+    eval_conf = float(
+        config.get("evaluation", {}).get("confidence_threshold", 0.25)
+    )
 
     # Reproducibility seed
     seed = training_config.get("seed", 42)
@@ -839,6 +925,12 @@ def train(config_path: str, verbose: bool = False, resume_from: Optional[str] = 
         )
         logger.info("Skipping torch.compile (%s)", reason)
 
+
+    # --- Exponential Moving Average of weights ---
+    # Maintains an averaged copy of the weights that is evaluated and
+    # checkpointed instead of the raw training weights (typically +1-3 mAP for
+    # detection). Returns None for wrappers without an underlying nn.Module.
+    ema = create_ema(model)
 
     logger.info("Loading dataset from %s", dataset_path)
     rdd_dataset = RDD2022Dataset(country_filter=country_filter)
@@ -1001,6 +1093,7 @@ def train(config_path: str, verbose: bool = False, resume_from: Optional[str] = 
     # --- Resume handling ---
     start_epoch = 0
     best_val_loss = float("inf")
+    best_map = -1.0  # best mAP@0.5 seen (used when checkpoint_metric == map_50)
     best_epoch = 0
     epochs_without_improvement = 0
 
@@ -1008,11 +1101,15 @@ def train(config_path: str, verbose: bool = False, resume_from: Optional[str] = 
         try:
             resume_path = _resolve_resume_path(resume_from, checkpoint_dir, model_type)
             logger.info("Loading resume state from: %s", resume_path)
-            state = _load_training_state(resume_path, model, optimizer, cosine_scheduler, scaler, device)
+            state = _load_training_state(
+                resume_path, model, optimizer, cosine_scheduler, scaler, device, ema=ema
+            )
             run_id = state.get("run_id")
             if run_id:
                 start_epoch = state["epoch"] + 1
                 best_val_loss = state["best_val_loss"]
+                if state.get("best_map") is not None:
+                    best_map = state["best_map"]
                 best_epoch = state["best_epoch"]
                 epochs_without_improvement = state["epochs_without_improvement"]
                 run_checkpoint_dir = Path(checkpoint_dir) / run_id
@@ -1135,6 +1232,9 @@ def train(config_path: str, verbose: bool = False, resume_from: Optional[str] = 
                 scaler.step(optimizer)
                 scaler.update()
 
+                # Update the EMA of weights after every optimizer step.
+                update_ema(ema, model)
+
                 train_loss_sum += loss_tensor.item()
                 train_batches += 1
 
@@ -1154,28 +1254,50 @@ def train(config_path: str, verbose: bool = False, resume_from: Optional[str] = 
             avg_train_loss = train_loss_sum / max(train_batches, 1)
 
             # --- Validation phase ---
+            # All validation runs under the EMA weights (ema_weights is a no-op
+            # when EMA is unavailable), so both val_loss and mAP reflect the
+            # averaged weights that will be checkpointed.
             model.set_eval_mode()
             val_loss_sum = 0.0
             val_batches = 0
+            val_map = None
 
-            with torch.no_grad():
-                for images, targets in val_loader:
-                    images = [img.to(device) for img in images]
-                    targets = [{k: v.to(device) for k, v in t.items()} for t in targets]
+            # Validation loss under the EMA weights (state-dict swap; train_step
+            # uses the training-forward path which does NOT fuse Conv+BN).
+            with ema_weights(model, ema):
+                with torch.no_grad():
+                    for images, targets in val_loader:
+                        images = [img.to(device) for img in images]
+                        targets = [{k: v.to(device) for k, v in t.items()} for t in targets]
 
-                    try:
-                        loss_dict = model.train_step(images, targets)
-                        loss_tensor = loss_dict["loss_tensor"]
-                        if loss_tensor.item() == 0.0:
+                        try:
+                            loss_dict = model.train_step(images, targets)
+                            loss_tensor = loss_dict["loss_tensor"]
+                            if loss_tensor.item() == 0.0:
+                                continue
+                            val_loss_sum += loss_tensor.item()
+                            val_batches += 1
+                        except Exception as e:
+                            logger.warning(
+                                "Exception in validation train_step at epoch %d: %s. Skipping batch.",
+                                epoch, e,
+                            )
                             continue
-                        val_loss_sum += loss_tensor.item()
-                        val_batches += 1
-                    except Exception as e:
-                        logger.warning(
-                            "Exception in validation train_step at epoch %d: %s. Skipping batch.",
-                            epoch, e,
-                        )
-                        continue
+
+            # Periodic mAP@0.5 evaluation on the val split (only when selecting
+            # checkpoints by mAP). Always evaluate the final epoch. Runs on a
+            # fusion-isolated deep copy so it never corrupts the training model.
+            if use_map_selection and (
+                (epoch + 1) % eval_interval == 0 or epoch == epochs - 1
+            ):
+                try:
+                    val_map = _evaluate_val_map(
+                        model, ema, val_loader, num_classes, eval_conf, device
+                    )
+                except Exception as e:
+                    logger.warning(
+                        "Per-epoch mAP eval failed at epoch %d: %s", epoch + 1, e
+                    )
 
             avg_val_loss = val_loss_sum / max(val_batches, 1)
 
@@ -1183,8 +1305,11 @@ def train(config_path: str, verbose: bool = False, resume_from: Optional[str] = 
             completed_epochs = epoch + 1
 
             logger.info(
-                "Epoch %d/%d complete | Train Loss: %.4f | Val Loss: %.4f | Time: %.1fs | LR: %.6f",
-                epoch + 1, epochs, avg_train_loss, avg_val_loss, epoch_time, current_lr,
+                "Epoch %d/%d complete | Train Loss: %.4f | Val Loss: %.4f | "
+                "mAP@0.5: %s | Time: %.1fs | LR: %.6f",
+                epoch + 1, epochs, avg_train_loss, avg_val_loss,
+                ("%.4f" % val_map) if val_map is not None else "n/a",
+                epoch_time, current_lr,
             )
 
             # --- Experiment tracking: log metrics per epoch ---
@@ -1194,6 +1319,8 @@ def train(config_path: str, verbose: bool = False, resume_from: Optional[str] = 
                 "learning_rate": current_lr,
                 "epoch_time_s": epoch_time,
             }
+            if val_map is not None:
+                epoch_metrics["map_50"] = val_map
             try:
                 tracker.log_metrics(run_id, step=epoch, metrics=epoch_metrics)
             except Exception as e:
@@ -1204,24 +1331,49 @@ def train(config_path: str, verbose: bool = False, resume_from: Optional[str] = 
                 "train_loss": avg_train_loss,
                 "val_loss": avg_val_loss,
             }
+            if val_map is not None:
+                current_metrics["map_50"] = val_map
 
-            # Best checkpoint: save when val_loss improves
-            if avg_val_loss < best_val_loss:
-                best_val_loss = avg_val_loss
+            # Decide whether this epoch is the new best by the configured metric.
+            # In map_50 mode, only epochs that were actually evaluated count
+            # (so early-stopping patience advances in eval_interval units).
+            if use_map_selection:
+                measured = val_map is not None
+                improved = measured and (val_map > best_map)
+            else:
+                measured = True
+                improved = avg_val_loss < best_val_loss
+
+            if improved:
                 best_epoch = epoch + 1  # 1-indexed
                 epochs_without_improvement = 0
+                if use_map_selection:
+                    best_map = val_map
+                else:
+                    best_val_loss = avg_val_loss
                 try:
-                    _save_checkpoint(
-                        run_checkpoint_dir / "best_model.pt",
-                        optimizer_obj=optimizer,
-                        epoch_num=epoch,
-                        metrics_dict=current_metrics,
+                    # Save the EMA weights as the best checkpoint.
+                    with ema_weights(model, ema):
+                        _save_checkpoint(
+                            run_checkpoint_dir / "best_model.pt",
+                            optimizer_obj=optimizer,
+                            epoch_num=epoch,
+                            metrics_dict=current_metrics,
+                        )
+                    logger.info(
+                        "Saved best model checkpoint (%s)",
+                        "mAP@0.5=%.4f" % best_map
+                        if use_map_selection
+                        else "val_loss=%.4f" % best_val_loss,
                     )
-                    logger.info("Saved best model checkpoint (val_loss=%.4f)", avg_val_loss)
                 except (IOError, OSError) as e:
                     logger.warning("Failed to save best checkpoint: %s", e)
-            else:
+            elif measured:
                 epochs_without_improvement += 1
+
+            # Keep best_val_loss current for logging/metadata even in map mode.
+            if use_map_selection and avg_val_loss < best_val_loss:
+                best_val_loss = avg_val_loss
 
             # Recovery checkpoint: every 5 epochs (1-indexed, so epoch+1 % 5 == 0)
             if (epoch + 1) % 5 == 0:
@@ -1236,23 +1388,31 @@ def train(config_path: str, verbose: bool = False, resume_from: Optional[str] = 
                 except (IOError, OSError) as e:
                     logger.warning("Failed to save recovery checkpoint: %s", e)
 
-            # Training state (always, for resume): overwritten each epoch
+            # Training state (always, for resume): overwritten each epoch.
+            # Saves the LIVE training weights (+ optimizer/scaler/EMA state) so
+            # resume continues optimisation; the EMA weights ride along
+            # separately and are restored into the EMA tracker on resume.
             try:
                 _save_training_state(
                     run_checkpoint_dir / "training_state.pt",
                     model, optimizer, cosine_scheduler, scaler,
                     epoch, best_val_loss, best_epoch, epochs_without_improvement,
-                    run_id, config,
+                    run_id, config, ema=ema, best_map=best_map,
                 )
             except (IOError, OSError) as e:
                 logger.warning("Failed to save training state: %s", e)
 
             # --- Early stopping check ---
             if epochs_without_improvement >= early_stopping_patience:
+                best_desc = (
+                    "mAP@0.5=%.4f" % best_map
+                    if use_map_selection
+                    else "val_loss=%.4f" % best_val_loss
+                )
                 logger.info(
                     "Early stopping triggered: no improvement for %d epochs. "
-                    "Best val_loss=%.4f at epoch %d (patience=%d)",
-                    epochs_without_improvement, best_val_loss, best_epoch, early_stopping_patience,
+                    "Best %s at epoch %d (patience=%d)",
+                    epochs_without_improvement, best_desc, best_epoch, early_stopping_patience,
                 )
                 break
 
@@ -1283,17 +1443,20 @@ def train(config_path: str, verbose: bool = False, resume_from: Optional[str] = 
             logger.warning("Failed to end experiment run: %s", e)
 
     # --- Final checkpoint ---
+    # Saved with EMA weights (the inference-quality artifact), consistent with
+    # best_model.pt.
     final_metrics_dict = {
         "train_loss": avg_train_loss,
         "val_loss": avg_val_loss,
     }
     try:
-        _save_checkpoint(
-            run_checkpoint_dir / "final_model.pt",
-            optimizer_obj=optimizer,
-            epoch_num=completed_epochs - 1 if completed_epochs > 0 else 0,
-            metrics_dict=final_metrics_dict,
-        )
+        with ema_weights(model, ema):
+            _save_checkpoint(
+                run_checkpoint_dir / "final_model.pt",
+                optimizer_obj=optimizer,
+                epoch_num=completed_epochs - 1 if completed_epochs > 0 else 0,
+                metrics_dict=final_metrics_dict,
+            )
         logger.info("Saved final model checkpoint")
     except (IOError, OSError) as e:
         logger.error("Failed to save final checkpoint: %s", e)
