@@ -942,6 +942,39 @@ def train(config_path: str, verbose: bool = False, resume_from: Optional[str] = 
     train_ds, val_ds, _ = rdd_dataset.split(train_ratio, val_split, 0.0, seed=seed)
     logger.info("Train: %d, Val: %d", len(train_ds), len(val_ds))
 
+    # --- SR-WBCE class re-weighting (optional) ---
+    # Set model.class_weights from the TRAIN split's per-class instance counts so
+    # Ultralytics' (E2E)DetectLoss up-weights rare classes. Computed after the
+    # split (and after the model is on device) so the rebuilt criterion picks it
+    # up. Class index order matches sorted(get_class_names()) used for targets.
+    loss_cfg = training_config.get("loss", {})
+    if loss_cfg.get("sr_wbce", False):
+        from model.training.class_weights import sr_wbce_weights, count_class_instances
+        sr_n = float(loss_cfg.get("sr_wbce_n", 4))
+        cw_names = train_ds.get_class_names()
+        cw_counts = count_class_instances(train_ds, cw_names)
+        cw_values = sr_wbce_weights(cw_counts, sr_n)
+        underlying = getattr(getattr(model, "_model", None), "model", None)
+        if underlying is not None:
+            underlying.class_weights = torch.tensor(
+                cw_values, dtype=torch.float32, device=device
+            )
+            # Rebuild the criterion so v8/E2E DetectLoss re-reads class_weights.
+            if hasattr(model, "_build_loss_fn"):
+                model._build_loss_fn()
+            elif hasattr(underlying, "init_criterion"):
+                underlying.criterion = underlying.init_criterion()
+            logger.info(
+                "SR-WBCE (n=%.1f) class weighting applied | counts=%s | weights=%s",
+                sr_n,
+                {n: c for n, c in zip(cw_names, cw_counts)},
+                {n: round(w, 3) for n, w in zip(cw_names, cw_values)},
+            )
+        else:
+            logger.warning(
+                "SR-WBCE requested but model has no _model.model; skipping class weighting."
+            )
+
     # Build augmentation pipeline from config (only applied to training set)
     aug_config = training_config.get("augmentation", {})
     augmentation_pipeline = build_augmentation_pipeline(aug_config) if aug_config else None
