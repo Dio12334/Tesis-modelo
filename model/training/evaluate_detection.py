@@ -889,7 +889,22 @@ def _as_float(value) -> float:
     return float(value)
 
 
-def _build_ground_truth(annotation, image_id: str, input_size: int) -> dict:
+def _letterbox_eval_tensor(image, input_size: int):
+    """Letterbox a PIL image into a square ``input_size`` canvas (grey pad),
+    preserving aspect ratio. Returns ``(tensor[1,C,H,W], r_w, r_h)`` where
+    ``r_w = W/max(W,H)``, ``r_h = H/max(W,H)`` are the fractions the content
+    occupies on each axis (used to remap normalized GT boxes to the canvas)."""
+    W, H = image.size
+    m = max(W, H)
+    s = input_size / m
+    nw, nh = max(1, int(round(W * s))), max(1, int(round(H * s)))
+    resized = image.resize((nw, nh), Image.BILINEAR)
+    canvas = Image.new("RGB", (input_size, input_size), (114, 114, 114))
+    canvas.paste(resized, ((input_size - nw) // 2, (input_size - nh) // 2))
+    return T.ToTensor()(canvas).unsqueeze(0), W / m, H / m
+
+
+def _build_ground_truth(annotation, image_id: str, input_size: int, lb=None) -> dict:
     """Build the normalized ground-truth entry for a single annotation.
 
     Produces exactly one ground-truth entry per annotation (Req 7.1). Each
@@ -914,6 +929,13 @@ def _build_ground_truth(annotation, image_id: str, input_size: int) -> dict:
     gt_labels: List[str] = []
     for bbox in annotation.bounding_boxes:
         raw = [bbox.x_min, bbox.y_min, bbox.x_max, bbox.y_max]
+        if lb is not None:
+            # Remap normalized box into the letterboxed canvas space (same uniform
+            # scale + pad applied to the image), so GT and predictions share frame.
+            r_w, r_h = lb
+            ox, oy = (1.0 - r_w) / 2.0, (1.0 - r_h) / 2.0
+            raw = [raw[0] * r_w + ox, raw[1] * r_h + oy,
+                   raw[2] * r_w + ox, raw[3] * r_h + oy]
         normalized, _mode = normalize_box(raw, input_size)
         clamped = clamp_and_filter(normalized, image_id)
         if clamped is None:
@@ -1020,6 +1042,7 @@ def run_inference(
     device,
     input_size: int,
     idx_to_class: Dict[int, str],
+    letterbox: bool = False,
 ) -> Tuple[List[dict], List[dict], List[str]]:
     """Run inference over a split, keeping predictions and GTs 1:1 aligned.
 
@@ -1088,15 +1111,20 @@ def run_inference(
     for i, annotation in enumerate(annotations):
         image_id = str(annotation.image_path)
 
-        # Req 7.1: exactly one ground-truth entry per annotation, in order.
-        ground_truths.append(_build_ground_truth(annotation, image_id, input_size))
-
         pred_entry: Optional[dict] = None
+        gt_entry: Optional[dict] = None
 
-        # Stage 1: load + transform + move tensor to device (Req 10.4).
+        # Stage 1: load + transform + move tensor to device (Req 10.4). Build the GT
+        # here too so letterbox can remap it with the same params used for the image.
         try:
             image = Image.open(annotation.image_path).convert("RGB")
-            image_tensor = transform(image).unsqueeze(0).to(device)
+            if letterbox:
+                image_tensor, r_w, r_h = _letterbox_eval_tensor(image, input_size)
+                image_tensor = image_tensor.to(device)
+                gt_entry = _build_ground_truth(annotation, image_id, input_size, lb=(r_w, r_h))
+            else:
+                image_tensor = transform(image).unsqueeze(0).to(device)
+                gt_entry = _build_ground_truth(annotation, image_id, input_size)
         except Exception as exc:
             # Req 14.2: image cannot be loaded/decoded -> WARNING + empty entry.
             logger.warning(
@@ -1104,6 +1132,11 @@ def run_inference(
             )
             errors.append(f"{image_id}: {exc}")
             pred_entry = _empty_prediction(image_id)
+
+        # Req 7.1: exactly one ground-truth entry per annotation, in order.
+        if gt_entry is None:
+            gt_entry = _build_ground_truth(annotation, image_id, input_size)
+        ground_truths.append(gt_entry)
 
         # Stage 2: forward pass under no_grad + post-process (Req 7.6).
         if pred_entry is None:
@@ -1864,12 +1897,17 @@ def evaluate(
         # positives from the mAP calculation.
         if hasattr(detector, "confidence_threshold"):
             detector.confidence_threshold = _INFERENCE_CONFIDENCE_FLOOR
+        _found_lb, _lb = _get_nested(config, ("training", "letterbox"))
+        _use_lb = bool(_lb) if _found_lb else False
+        if _use_lb:
+            logger.info("Letterbox resize ENABLED for evaluation (matches letterbox training)")
         predictions, ground_truths, errors = run_inference(
             detector=detector,
             split_ds=split_ds,
             device=device,
             input_size=int(input_size),
             idx_to_class=idx_to_class,
+            letterbox=_use_lb,
         )
 
     except ConfigurationError:
