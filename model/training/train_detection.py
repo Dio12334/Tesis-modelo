@@ -879,6 +879,10 @@ def train(config_path: str, verbose: bool = False, resume_from: Optional[str] = 
     # Oversamples images with rare classes / from data-poor countries to fight the
     # imbalance (e.g. pothole/other, Czech). See _build_balanced_sampler.
     balanced_sampling = str(training_config.get("balanced_sampling", "off")).lower()
+    # Fine-tuning / transfer: initialise weights from an existing checkpoint AFTER the model
+    # is built. Unlike --resume, this loads WEIGHTS ONLY (fresh optimizer/EMA/epoch), so you
+    # can keep training on a different dataset with a new (e.g. lower) learning rate.
+    init_checkpoint = training_config.get("init_checkpoint")
 
     # Reproducibility seed
     seed = training_config.get("seed", 42)
@@ -940,6 +944,15 @@ def train(config_path: str, verbose: bool = False, resume_from: Optional[str] = 
     elif hasattr(model, "to"):
         model.to(device)
     logger.info("Model moved to %s", device)
+
+    # Fine-tune init: load weights from a prior checkpoint (weights only, no optimizer/epoch).
+    if init_checkpoint:
+        try:
+            model.load_checkpoint(Path(init_checkpoint))
+            logger.info("Initialised weights from checkpoint (fine-tuning): %s", init_checkpoint)
+        except Exception as e:
+            logger.error("Failed to load init_checkpoint '%s': %s", init_checkpoint, e)
+            return {}
 
     # Convert model to channels_last memory format for Tensor Core optimization.
     # Must happen AFTER .to(device) and BEFORE torch.compile (compile traces graph).

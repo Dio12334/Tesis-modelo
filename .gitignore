@@ -217,3 +217,6 @@ checkpoints/**
 
 **.pt
 **.sh
+
+# Secretos / credenciales en texto plano — NO commitear
+docs/DATASET_EXPORT_GUIDE.md
