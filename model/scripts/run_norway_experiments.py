@@ -114,9 +114,15 @@ def main():
         if not args.force and rd and find_report(rd):
             print(f"[skip] {name}: ya tiene reporte de evaluación (usa --force para rehacer)")
         else:
+            # Resume-on-partial: si quedó un training_state.pt (época completada) sin eval,
+            # continuar en vez de reentrenar desde cero (robusto a cortes a media corrida).
+            resume = []
+            if not args.force and rd and os.path.exists(os.path.join(rd, "training_state.pt")):
+                resume = ["--resume", os.path.basename(rd)]
+                print(f"  [resume] {name}: continuando desde {os.path.basename(rd)}")
             print(f"\n===== {name}: TRAIN ({args.epochs} ép, batch {args.batch}, "
                   f"letterbox={letterbox}, {len(countries)} países) =====")
-            rc = run([py, "-m", "model.training.train_detection", "--config", cfg_path, "-v"],
+            rc = run([py, "-m", "model.training.train_detection", "--config", cfg_path, "-v"] + resume,
                      LOGDIR / f"{name}_train.log")
             if rc != 0:
                 print(f"  [FALLO] train {name} (rc={rc}); ver {LOGDIR}/{name}_train.log")
