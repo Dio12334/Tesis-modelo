@@ -1,0 +1,91 @@
+name: rdd2022_rt_detr_l_norway_letterbox
+
+# Experimento N3 — incluir Noruega correctamente. Sobre la receta R, con:
+#   country_filter += Norway   (8161 imgs grandes 4040x2035, antes excluidas)
+#   letterbox: true            (preserva aspecto 2:1 -> no distorsiona)  [train Y eval]
+#   input_size 768 -> 1024     (menos downsample: 4040->1024 = 3.9x vs 5.26x a 768)
+# Hipótesis: el bajo mAP de Noruega era artefacto del resize cuadrado; con letterbox +
+# resolución, Noruega aporta (más datos) en vez de meter ruido. Ver docs/EXPERIMENTO_NORUEGA.md.
+#
+# Ablaciones (copiar este YAML y tocar):
+#   N1 (naïve):  quitar Norway? no -> mantener Norway, letterbox:false, input 768
+#   N2:          letterbox:true, input 768
+#   N3 (este):   letterbox:true, input 1024
+#
+# OJO VRAM: 1024 + Noruega NO cabe en 8GB -> este config es para la EC2 (~25GB).
+# En laptop, para sanity: bajar input_size a 768 y batch_size a 4.
+
+model:
+  type: rt_detr
+  config:
+    model_size: "l"
+    input_size: 1024           # << más resolución (era 768)
+    num_classes: 5             # RDD comparte taxonomía entre países
+    confidence_threshold: 0.5
+    iou_threshold: 0.5
+    backbone_layers: 10
+    backbone_lr: 0.00001       # S5
+    head_lr: 0.0001            # S5
+
+dataset:
+  type: rdd2022
+  path: model/data/rdd2022/
+  class_mapping: model/configs/rdd2022_classes.yaml
+  country_filter: [Japan, India, United_States, Czech, Norway]   # << + Noruega
+
+training:
+  letterbox: true             # << preserva aspecto (train Y eval); clave para Noruega 2:1
+  epochs: 40
+  early_stopping_patience: 12
+  batch_size: 6               # ajustar a la VRAM de la EC2 (subir si cabe)
+  num_workers: 8
+  prefetch_factor: 4
+  use_amp: true
+  use_torch_compile: false
+  learning_rate: 0.0001
+  optimizer: AdamW
+  weight_decay: 0.0005         # R
+  momentum: 0.937
+  scheduler: cosine
+  warmup_epochs: 3
+  val_split: 0.2
+  checkpoint_dir: ./checkpoints/rt_detr_norway
+  log_interval: 10
+  seed: 42
+
+  use_ema: true
+  ema_decay: 0.9999
+  ema_tau: 2000
+
+  loss:
+    focal_loss: true
+    focal_gamma: 2.0
+    focal_alpha: 0.25          # S1
+    no_object_weight: 0.1      # S1
+    class_weight: 1.0
+    bbox_weight: 5.0
+    giou_weight: 2.0
+
+  augmentation:
+    horizontal_flip: true
+    mosaic: 0.0
+    mixup: 0.0
+    mosaic_off_epochs: 0
+    hsv_h: 0.015
+    hsv_s: 0.5
+    hsv_v: 0.4
+    scale: [0.8, 1.2]
+    translate: 0.1
+    random_erasing: 0.3        # R
+
+evaluation:
+  iou_thresholds: [0.25, 0.5, 0.75]
+  confidence_threshold: 0.5
+  confidence_thresholds_sweep:
+    [0.05, 0.10, 0.15, 0.20, 0.25, 0.30, 0.35, 0.40, 0.45, 0.50,
+     0.55, 0.60, 0.65, 0.70, 0.75, 0.80, 0.85, 0.90, 0.95, 1.00]
+
+output:
+  checkpoint_dir: ./checkpoints/rt_detr_norway
+  results_dir: ./results/rt_detr_norway
+  log_dir: ./logs/rt_detr_norway

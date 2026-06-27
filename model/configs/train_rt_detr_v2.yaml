@@ -1,0 +1,87 @@
+name: rdd2022_rt_detr_l_v2
+
+# Variante SOTA sobre train_rt_detr.yaml. Cambios respecto a v1 (ver
+# docs/MEJORAS_METRICAS_RT_DETR.md §estado del arte):
+#   S1  loss pro-recall:  no_object_weight 0.3 -> 0.1, focal_alpha 0.20 -> 0.25
+#   S2  resolución:       input_size 640 -> 768 (batch 8 -> 6 por VRAM de 8 GB)
+#   S5  LR discriminativo: backbone_lr 1e-5 / head_lr 1e-4 (fine-tune del backbone COCO)
+#   S3  EMA:              use_ema true (pesos EMA -> best/final, contra overfitting)
+#   sched: epochs 100 -> 40 para que el cosine SÍ decaiga (en v1 el LR nunca bajó)
+# Mantiene lo validado: sin mosaic/mixup, países sin China/Norway, COCO-pretrained.
+# NO congela capas a propósito: el dominio (asfalto/grietas) difiere mucho de COCO,
+# así que se usa "freeze blando" vía backbone_lr bajo en lugar de freeze_layers.
+
+model:
+  type: rt_detr
+  config:
+    model_size: "l"
+    input_size: 768            # S2 (si OOM en 8 GB: bajar a 640 o batch_size a 4)
+    num_classes: 5
+    confidence_threshold: 0.5
+    iou_threshold: 0.5
+    backbone_layers: 10        # primeros N grupos de params tratados como backbone
+    backbone_lr: 0.00001       # S5 — LR bajo para el backbone preentrenado
+    head_lr: 0.0001            # S5 — LR normal para las cabezas
+
+dataset:
+  type: rdd2022
+  path: model/data/rdd2022/
+  class_mapping: model/configs/rdd2022_classes.yaml
+  country_filter: [Japan, India, United_States, Czech]  # sin China ni Norway
+
+training:
+  epochs: 40                   # horizonte real para que el cosine decaiga
+  early_stopping_patience: 12
+  batch_size: 6                # S2 — compensa la mayor resolución (subir a 8 si hay VRAM)
+  num_workers: 4
+  use_amp: true
+  learning_rate: 0.0001        # base de warmup / eta_min; el LR efectivo lo fijan backbone_lr/head_lr
+  optimizer: AdamW
+  weight_decay: 0.0001
+  momentum: 0.937
+  scheduler: cosine
+  warmup_epochs: 3
+  val_split: 0.2
+  checkpoint_dir: ./checkpoints/rt_detr_v2
+  log_interval: 10
+  seed: 42
+
+  # EMA (S3) — pesos promediados, mejor generalización; best/final se guardan del EMA
+  use_ema: true
+  ema_decay: 0.9999
+  ema_tau: 2000
+
+  early_stopping_metric: map
+  eval_interval: 5
+
+  loss:
+    focal_loss: true
+    focal_gamma: 2.0
+    focal_alpha: 0.25         # S1 (0.20 -> 0.25): menos castigo a positivos -> más recall
+    no_object_weight: 0.1     # S1 (0.3 -> 0.1, default RT-DETR): recupera recall
+    class_weight: 1.0
+    bbox_weight: 5.0
+    giou_weight: 2.0          # (opcional: subir a 3.0 para apretar cajas / mAP@.5:.95)
+
+  augmentation:
+    horizontal_flip: true
+    mosaic: 0.0               # validado: mosaic baja mAP en daño vial (objetos pequeños)
+    mixup: 0.0
+    mosaic_off_epochs: 0
+    hsv_h: 0.015
+    hsv_s: 0.5
+    hsv_v: 0.4
+    scale: [0.8, 1.2]
+    translate: 0.1
+
+evaluation:
+  iou_thresholds: [0.25, 0.5, 0.75]
+  confidence_threshold: 0.5
+  confidence_thresholds_sweep:
+    [0.05, 0.10, 0.15, 0.20, 0.25, 0.30, 0.35, 0.40, 0.45, 0.50,
+     0.55, 0.60, 0.65, 0.70, 0.75, 0.80, 0.85, 0.90, 0.95, 1.00]
+
+output:
+  checkpoint_dir: ./checkpoints/rt_detr_v2
+  results_dir: ./results/rt_detr_v2
+  log_dir: ./logs/rt_detr_v2

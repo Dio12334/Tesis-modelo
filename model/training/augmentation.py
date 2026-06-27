@@ -413,6 +413,7 @@ class RandomIoUCrop:
         centers_x = (boxes_px[:, 0] + boxes_px[:, 2]) * 0.5
         centers_y = (boxes_px[:, 1] + boxes_px[:, 3]) * 0.5
 
+        crop_box = np.empty((1, 4), dtype=np.float32)
         for _ in range(self.trials):
             crop = self._sample_crop(h, w)
             if crop is None:
@@ -431,7 +432,8 @@ class RandomIoUCrop:
                 continue
 
             kept = boxes_px[mask]
-            ious = _box_iou_per_pair(kept, np.array([[x1, y1, x2, y2]], dtype=np.float32))
+            crop_box[0] = (x1, y1, x2, y2)
+            ious = _box_iou_per_pair(kept, crop_box)
             if float(ious.min()) < float(mode):
                 # IoU threshold not satisfied for at least one kept box.
                 continue
