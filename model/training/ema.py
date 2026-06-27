@@ -32,13 +32,13 @@ logger = logging.getLogger(__name__)
 
 try:  # pragma: no cover - exercised indirectly in the thesis env
     from ultralytics.utils.torch_utils import ModelEMA, unwrap_model
-except Exception:  # ultralytics missing or API drift
+except ImportError:  # ultralytics missing or API drift
     ModelEMA = None  # type: ignore[assignment]
     unwrap_model = None  # type: ignore[assignment]
 
 try:
     import torch.nn as _nn
-except Exception:  # pragma: no cover
+except ImportError:  # pragma: no cover
     _nn = None  # type: ignore[assignment]
 
 
