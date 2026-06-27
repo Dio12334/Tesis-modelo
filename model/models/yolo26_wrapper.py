@@ -92,10 +92,15 @@ class YOLO26Detector(BaseDetector):
                 raise FileNotFoundError(
                     f"Pretrained weights not found: {weights_path}"
                 )
-            self._model = ultralytics.YOLO(str(pretrained_weights))
+        base_weights = pretrained_weights or self.MODEL_FILE_MAP[self.model_size]
+
+        if config.get("lfc", False):
+            # Layer-wise Feature Compression: build a half-width-P5 architecture
+            # and transfer compatible pretrained weights.
+            from model.models.lfc import build_lfc_model
+            self._model = build_lfc_model(str(base_weights))
         else:
-            model_file = self.MODEL_FILE_MAP[self.model_size]
-            self._model = ultralytics.YOLO(model_file)
+            self._model = ultralytics.YOLO(str(base_weights))
 
         # Reshape detection head if pretrained model has different num_classes
         self._reshape_head_if_needed()
