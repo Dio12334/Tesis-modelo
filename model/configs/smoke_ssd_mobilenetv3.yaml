@@ -1,0 +1,65 @@
+name: smoke_ssd_mobilenetv3
+
+# Smoke-test config: 2 epochs on the small sample dataset to verify the
+# end-to-end training loop (model + dataset + augmentation + freeze schedule +
+# optimizer rebuild) runs without errors. Do NOT use for real experiments.
+
+model:
+  type: ssd_mobilenetv3
+  config:
+    input_size: 320                  # 320 is faster for the smoke test
+    num_classes: 5
+    pretrained_backbone: false       # avoid weight download on first run
+    trainable_backbone_layers: 6
+    confidence_threshold: 0.25
+    score_threshold: 0.001
+    nms_threshold: 0.5
+    detections_per_image: 100
+    topk_candidates: 100
+    freeze_backbone_epochs: 1        # tests the freeze->unfreeze hook + rebuild
+    backbone_lr: 0.00003
+    head_lr: 0.0003
+
+dataset:
+  type: rdd2022
+  path: model/data/rdd2022/sample
+  class_mapping: model/configs/rdd2022_classes.yaml
+
+training:
+  epochs: 2
+  early_stopping_patience: 5
+  batch_size: 4
+  num_workers: 2
+  prefetch_factor: 2
+  use_amp: false                     # AMP off for clearer error tracebacks
+  use_channels_last: false
+  learning_rate: 0.0003
+  optimizer: AdamW
+  weight_decay: 0.0001
+  scheduler: cosine
+  warmup_epochs: 0
+  val_split: 0.2
+  checkpoint_dir: ./checkpoints/smoke_ssd_mobilenetv3
+  log_interval: 5
+  seed: 42
+  augmentation:
+    mosaic: 0.0
+    mixup: 0.0
+    horizontal_flip: true
+    vertical_flip: false
+    hsv_h: 0.015
+    hsv_s: 0.3
+    hsv_v: 0.3
+    scale: [0.9, 1.1]
+    translate: 0.05
+    random_iou_crop: true
+
+evaluation:
+  iou_thresholds: [0.5]
+  confidence_threshold: 0.25
+  confidence_thresholds_sweep: [0.1, 0.25, 0.5]
+
+output:
+  checkpoint_dir: ./checkpoints/smoke_ssd_mobilenetv3
+  results_dir: ./checkpoints/smoke_ssd_mobilenetv3
+  log_dir: ./logs/smoke_ssd_mobilenetv3

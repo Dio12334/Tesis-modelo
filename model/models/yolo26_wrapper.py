@@ -100,6 +100,11 @@ class YOLO26Detector(BaseDetector):
         # Reshape detection head if pretrained model has different num_classes
         self._reshape_head_if_needed()
 
+        # Apply YOLO-RD architecture modifications (CSAF stem + LGECA) if
+        # requested. Done in-place after head reshape so unchanged layers keep
+        # their pretrained weights; only CSAF/LGECA start from random init.
+        self._apply_yolo_rd_if_needed()
+
         # Configure parameter freezing for transfer learning
         freeze_backbone = config.get("freeze_backbone", False)
         freeze_layers = config.get("freeze_layers", None)
@@ -325,6 +330,28 @@ class YOLO26Detector(BaseDetector):
             f"Detection head reshaped successfully: "
             f"cv3 rebuilt for {self.num_classes} classes with ch={ch}"
         )
+
+    def _apply_yolo_rd_if_needed(self) -> None:
+        """Insert YOLO-RD's CSAF/LGECA modules if enabled in config.
+
+        Controlled by ``csaf`` and ``lgeca`` booleans in the model config. No-op
+        when both are absent/false (the model stays a stock YOLO26). Surgery is
+        in-place on ``self._model.model`` and preserves forward routing, so
+        unchanged layers keep their pretrained weights.
+        """
+        use_csaf = bool(self.config.get("csaf", False))
+        use_lgeca = bool(self.config.get("lgeca", False))
+        if not (use_csaf or use_lgeca):
+            return
+
+        model_module = getattr(self._model, "model", None)
+        if model_module is None or not hasattr(model_module, "model"):
+            logger.warning("Cannot apply YOLO-RD modules: model structure not found.")
+            return
+
+        from model.models.yolo_rd_modules import apply_yolo_rd
+
+        apply_yolo_rd(model_module, use_csaf=use_csaf, use_lgeca=use_lgeca)
 
     @staticmethod
     def _get_input_channels(module) -> int:

@@ -31,6 +31,14 @@ import numpy as np
 
 from model.config.manager import ConfigManager
 from model.training.augmentation import build_augmentation_pipeline
+from model.training.ema import (
+    create_ema,
+    update_ema,
+    ema_weights,
+    ema_eval_model,
+    ema_state_dict,
+    load_ema_state,
+)
 from model.datasets.rdd2022 import RDD2022Dataset
 from model.models import ModelRegistry
 from model.exceptions import ModelNotFoundError, ConfigurationError
@@ -63,7 +71,6 @@ class RDD2022TorchDataset(torch.utils.data.Dataset):
         mixup: float = 0.0,
         mosaic_scale_gain: float = 0.5,
         mosaic_translate: float = 0.1,
-        letterbox: bool = False,
     ):
         """Initialize the dataset adapter.
 
@@ -87,11 +94,6 @@ class RDD2022TorchDataset(torch.utils.data.Dataset):
         self._input_size = input_size
         self._class_names = dataset.get_class_names()
         self._augmentation = augmentation  # augmentation.Compose pipeline or None
-        # Letterbox = resize preserving aspect ratio + grey padding (instead of a
-        # square squish). Matters for non-square images (e.g. Norway 4040x2035, 2:1):
-        # the square resize distorts shapes and destroys detail; letterbox keeps the
-        # aspect ratio. Bboxes are transformed accordingly in _letterbox_resize.
-        self._letterbox = bool(letterbox)
         self._mosaic_p = mosaic
         self._mixup_p = mixup
         self._mosaic_enabled = mosaic > 0  # Can be toggled off for final epochs
@@ -123,30 +125,6 @@ class RDD2022TorchDataset(torch.utils.data.Dataset):
             T.Resize((input_size, input_size)),
             T.ToTensor(),
         ])
-
-    def _letterbox_resize(self, image_np: np.ndarray, bboxes: List[List]) -> Tuple[np.ndarray, List[List]]:
-        """Resize ``image_np`` into a square ``input_size`` canvas preserving its
-        aspect ratio (grey 114 padding), and remap the normalized ``bboxes``
-        accordingly. ``bboxes`` are ``[x_min, y_min, x_max, y_max, ...]`` in [0,1]
-        of ``image_np``; the returned bboxes are normalized to the canvas.
-        """
-        h, w = image_np.shape[:2]
-        size = self._input_size
-        s = size / max(h, w)
-        nw, nh = max(1, int(round(w * s))), max(1, int(round(h * s)))
-        resized = cv2.resize(image_np, (nw, nh), interpolation=cv2.INTER_LINEAR)
-        canvas = np.full((size, size, 3), 114, dtype=np.uint8)
-        pad_x = (size - nw) // 2
-        pad_y = (size - nh) // 2
-        canvas[pad_y:pad_y + nh, pad_x:pad_x + nw] = resized
-        out: List[List] = []
-        for b in bboxes:
-            nx1 = (b[0] * nw + pad_x) / size
-            ny1 = (b[1] * nh + pad_y) / size
-            nx2 = (b[2] * nw + pad_x) / size
-            ny2 = (b[3] * nh + pad_y) / size
-            out.append([nx1, ny1, nx2, ny2] + list(b[4:]))
-        return canvas, out
 
     def _resolve_class_idx(self, label, context: str = "") -> int:
         """Resolve a raw class label to its integer index, strictly.
@@ -503,16 +481,13 @@ class RDD2022TorchDataset(torch.utils.data.Dataset):
 
                 image_np, aug_bboxes = self._augmentation(image_np, aug_bboxes)
 
-                # Resize to input_size: letterbox (preserve aspect) or square squish.
-                if self._letterbox:
-                    image_np, aug_bboxes = self._letterbox_resize(image_np, aug_bboxes)
-                else:
-                    h, w = image_np.shape[:2]
-                    if h != self._input_size or w != self._input_size:
-                        image_np = cv2.resize(
-                            image_np, (self._input_size, self._input_size),
-                            interpolation=cv2.INTER_LINEAR,
-                        )
+                # Resize to input_size and convert to tensor (avoid PIL intermediate)
+                h, w = image_np.shape[:2]
+                if h != self._input_size or w != self._input_size:
+                    image_np = cv2.resize(
+                        image_np, (self._input_size, self._input_size),
+                        interpolation=cv2.INTER_LINEAR,
+                    )
                 image_tensor = torch.from_numpy(
                     image_np.transpose(2, 0, 1).copy()
                 ).float().div_(255.0)
@@ -529,27 +504,6 @@ class RDD2022TorchDataset(torch.utils.data.Dataset):
                             bbox[4], context=f"image={annotation.image_path}"
                         )
                         labels.append(class_idx)
-            elif self._letterbox:
-                # No per-image augmentation, but letterbox the (possibly non-square) image.
-                image_np = np.array(image)
-                image.close()  # Release PIL buffer
-                db = [[b.x_min, b.y_min, b.x_max, b.y_max, b.class_label]
-                      for b in annotation.bounding_boxes]
-                image_np, db = self._letterbox_resize(image_np, db)
-                image_tensor = torch.from_numpy(
-                    image_np.transpose(2, 0, 1).copy()
-                ).float().div_(255.0)
-                boxes = []
-                labels = []
-                for bbox in db:
-                    x1 = bbox[0] * self._input_size
-                    y1 = bbox[1] * self._input_size
-                    x2 = bbox[2] * self._input_size
-                    y2 = bbox[3] * self._input_size
-                    if x2 > x1 and y2 > y1:
-                        boxes.append([x1, y1, x2, y2])
-                        labels.append(self._resolve_class_idx(
-                            bbox[4], context=f"image={annotation.image_path}"))
             else:
                 image_tensor = self._transform(image)
                 image.close()  # Release PIL buffer
@@ -587,62 +541,6 @@ def collate_fn(batch):
     images = [item[0] for item in batch]
     targets = [item[1] for item in batch]
     return images, targets
-
-
-def _build_balanced_sampler(annotations, mode):
-    """Build a ``WeightedRandomSampler`` for class/country-balanced training.
-
-    ``mode`` is one of ``"class"``, ``"country"``, ``"both"``. Per-image weights use
-    a softened inverse image-frequency (``1/sqrt(n_images_with)``) so rare classes /
-    data-poor countries are oversampled without collapsing onto a handful of images:
-
-    - ``class``:   weight = max over the classes present in the image of
-      ``1/sqrt(n_img(class))``. Empty (negative) images get the most-common class's
-      weight, so negatives are still sampled at the baseline rate (they matter for
-      precision) rather than boosted.
-    - ``country``: weight = ``1/sqrt(n_img(country))``.
-    - ``both``:    product of the class and country weights.
-
-    Returns ``(sampler, stats)`` where ``stats`` is a dict for logging.
-    """
-    n = len(annotations)
-    class_img_count: dict = {}
-    country_img_count: dict = {}
-    img_classes = []
-    img_country = []
-    for ann in annotations:
-        classes = {bb.class_label for bb in ann.bounding_boxes}
-        img_classes.append(classes)
-        for c in classes:
-            class_img_count[c] = class_img_count.get(c, 0) + 1
-        country = ann.metadata.get("country") or "unknown"
-        img_country.append(country)
-        country_img_count[country] = country_img_count.get(country, 0) + 1
-
-    base_class_w = (1.0 / math.sqrt(max(class_img_count.values()))) if class_img_count else 1.0
-
-    def _cls_w(classes):
-        if not classes:
-            return base_class_w
-        return max(1.0 / math.sqrt(class_img_count[c]) for c in classes)
-
-    def _ctry_w(country):
-        return 1.0 / math.sqrt(country_img_count.get(country, 1))
-
-    weights = []
-    for i in range(n):
-        if mode == "class":
-            w = _cls_w(img_classes[i])
-        elif mode == "country":
-            w = _ctry_w(img_country[i])
-        else:  # both
-            w = _cls_w(img_classes[i]) * _ctry_w(img_country[i])
-        weights.append(w)
-
-    sampler = torch.utils.data.WeightedRandomSampler(
-        torch.as_tensor(weights, dtype=torch.double), num_samples=n, replacement=True
-    )
-    return sampler, {"class_img_count": class_img_count, "country_img_count": country_img_count}
 
 
 # -------------------------------------------------------------------------
@@ -701,25 +599,26 @@ def _set_model_state_dict(model, state_dict):
 
 def _save_training_state(path, model, optimizer, scheduler, scaler, epoch,
                          best_val_loss, best_epoch, epochs_without_improvement,
-                         run_id, config_used, ema=None):
-    """Save full training state (model + optimizer + scheduler + metadata) for resume.
-
-    Saves the *live* (raw) model weights here — resume must continue training the
-    raw trajectory, not the EMA shadow. The EMA shadow is stored separately under
-    ``ema_state_dict`` so it survives a resume too.
-    """
+                         run_id, config_used, ema=None, best_map=None):
+    """Save full training state (model + optimizer + scheduler + metadata) for resume."""
     state = {
         "model_state_dict": _get_model_state_dict(model),
         "optimizer_state_dict": optimizer.state_dict(),
         "scheduler_state_dict": scheduler.state_dict() if scheduler else None,
         "scaler_state_dict": scaler.state_dict() if scaler else None,
-        "ema_state_dict": ema.state_dict() if ema is not None else None,
         "epoch": epoch,
         "best_val_loss": best_val_loss,
         "best_epoch": best_epoch,
         "epochs_without_improvement": epochs_without_improvement,
         "run_id": run_id,
         "config_used": config_used,
+        # EMA weights + averaged-update count, so resume continues the moving
+        # average instead of re-seeding it from the resumed live weights.
+        "ema_state_dict": ema_state_dict(ema),
+        "ema_updates": getattr(ema, "updates", None) if ema is not None else None,
+        # Best mAP for map_50-based checkpoint selection (None when selecting
+        # on val_loss).
+        "best_map": best_map,
     }
     torch.save(state, str(path))
 
@@ -729,12 +628,13 @@ def _load_training_state(path, model, optimizer, scheduler, scaler, device, ema=
 
     Supports both new-format checkpoints (with optimizer/scheduler/scaler state) and
     old-format checkpoints (model weights only). When optimizer state is missing,
-    only model weights are loaded and a warning is logged. The EMA shadow is
-    restored when present and ``ema`` is provided (older checkpoints simply keep
-    the freshly-initialised EMA).
+    only model weights are loaded and a warning is logged.
     """
     state = torch.load(str(path), map_location=device)
     _set_model_state_dict(model, state["model_state_dict"])
+
+    # Restore the EMA moving average if present (new-format checkpoints only).
+    load_ema_state(ema, state.get("ema_state_dict"), state.get("ema_updates"))
 
     if "optimizer_state_dict" in state:
         optimizer.load_state_dict(state["optimizer_state_dict"])
@@ -742,8 +642,6 @@ def _load_training_state(path, model, optimizer, scheduler, scaler, device, ema=
             scheduler.load_state_dict(state["scheduler_state_dict"])
         if scaler and state.get("scaler_state_dict"):
             scaler.load_state_dict(state["scaler_state_dict"])
-        if ema is not None and state.get("ema_state_dict"):
-            ema.load_state_dict(state["ema_state_dict"], device=device)
     else:
         logger.warning(
             "Checkpoint '%s' has no optimizer state (old format). "
@@ -756,70 +654,61 @@ def _load_training_state(path, model, optimizer, scheduler, scaler, device, ema=
         state.setdefault("epochs_without_improvement", 0)
         state.setdefault("run_id", None)
 
+    state.setdefault("best_map", None)
     return state
 
 
-class ModelEMA:
-    """Exponential Moving Average of model weights (RT-DETR / Ultralytics recipe).
+def _evaluate_val_map(model, ema, val_loader, num_classes, eval_conf, device):
+    """Compute mAP@0.5 on the val split using the EMA weights.
 
-    Keeps a shadow copy of the model's ``state_dict`` (with the ``torch.compile``
-    ``_orig_mod.`` prefix stripped, via ``_get_model_state_dict``), updated after
-    every optimizer step as ``v = d*v + (1-d)*w``. The decay ramps up so early
-    averages aren't dominated by the noisy initial weights:
-    ``d = base * (1 - exp(-updates / tau))``.
+    Reuses the existing ``val_loader`` (images already resized to the model's
+    input size, so inputs are stride-divisible) and runs inference on a
+    fusion-isolated deep copy of the model holding the EMA weights. Boxes from
+    predictions and targets are both in the same input-size pixel space; IoU is
+    scale-invariant, so no coordinate normalisation is required.
 
-    EMA weights generalise better than the final raw weights, so they are what
-    gets written to ``best_model.pt`` / ``final_model.pt`` for evaluation. The
-    shadow is GPU-resident (~weights size, e.g. ~130 MB for RT-DETR-L) and is
-    persisted in ``training_state.pt`` so resume continues the average.
+    Returns the mAP@0.5 as a float (0.0 if no usable predictions/targets).
     """
+    from model.evaluation.metrics import compute_map
 
-    def __init__(self, model, decay: float = 0.9999, tau: float = 2000.0):
-        self.shadow = {
-            k: v.detach().clone().float()
-            for k, v in _get_model_state_dict(model).items()
-        }
-        self.decay_base = float(decay)
-        self.tau = float(tau)
-        self.updates = 0
+    predictions = []
+    ground_truths = []
+    img_id = 0
 
-    def _decay(self) -> float:
-        return self.decay_base * (1.0 - math.exp(-self.updates / self.tau))
+    with ema_eval_model(model, ema):
+        # Lower the confidence floor during eval so the precision-recall curve
+        # is not truncated (mirrors the offline evaluator's low-conf inference).
+        prev_conf = getattr(model, "confidence_threshold", None)
+        try:
+            if prev_conf is not None:
+                model.confidence_threshold = min(prev_conf, 0.01)
+            with torch.no_grad():
+                for images, targets in val_loader:
+                    batch = torch.stack([img.to(device) for img in images])
+                    results = model.forward(batch)
+                    for res, tgt in zip(results, targets):
+                        predictions.append({
+                            "image_id": img_id,
+                            "boxes": res["boxes"].detach().cpu().tolist(),
+                            "labels": [int(x) for x in res["labels"].detach().cpu().tolist()],
+                            "scores": [float(x) for x in res["scores"].detach().cpu().tolist()],
+                        })
+                        ground_truths.append({
+                            "image_id": img_id,
+                            "boxes": tgt["boxes"].detach().cpu().tolist(),
+                            "labels": [int(x) for x in tgt["labels"].detach().cpu().tolist()],
+                        })
+                        img_id += 1
+        finally:
+            if prev_conf is not None:
+                model.confidence_threshold = prev_conf
 
-    @torch.no_grad()
-    def update(self, model) -> None:
-        """Update the shadow toward the current model weights (call after each step)."""
-        self.updates += 1
-        d = self._decay()
-        msd = _get_model_state_dict(model)
-        for k, sv in self.shadow.items():
-            mv = msd.get(k)
-            if mv is None:
-                continue
-            if sv.dtype.is_floating_point:
-                sv.mul_(d).add_(mv.detach().float(), alpha=1.0 - d)
-            else:
-                sv.copy_(mv)
-
-    def save(self, path) -> None:
-        """Write the EMA weights as ``{"model_state_dict": ...}`` (load_checkpoint-compatible)."""
-        Path(path).parent.mkdir(parents=True, exist_ok=True)
-        cpu_state = {k: v.detach().to("cpu") for k, v in self.shadow.items()}
-        torch.save({"model_state_dict": cpu_state}, str(path))
-
-    def state_dict(self) -> dict:
-        return {
-            "shadow": {k: v.detach().to("cpu") for k, v in self.shadow.items()},
-            "updates": self.updates,
-        }
-
-    def load_state_dict(self, sd, device=None) -> None:
-        shadow = sd.get("shadow", {})
-        self.shadow = {
-            k: (v.to(device) if device is not None else v).float()
-            for k, v in shadow.items()
-        }
-        self.updates = int(sd.get("updates", 0))
+    present = sorted({l for gt in ground_truths for l in gt["labels"]})
+    class_names = present if present else list(range(num_classes))
+    result = compute_map(
+        predictions, ground_truths, iou_thresholds=[0.5], class_names=class_names
+    )
+    return float(result["map_50"])
 
 
 def _resolve_resume_path(resume_from, checkpoint_dir, model_type):
@@ -913,30 +802,20 @@ def train(config_path: str, verbose: bool = False, resume_from: Optional[str] = 
     early_stopping_patience = training_config.get("early_stopping_patience", 15)
     use_channels_last = bool(training_config.get("use_channels_last", False))
     prefetch_factor = int(training_config.get("prefetch_factor", 2))
-    # How often to persist the full resume state (training_state.pt). Measured I/O
-    # cost is <0.2% of an epoch, so we default to every epoch: this gives crash-safe
-    # resume from the last completed epoch (important since a Windows Ctrl-C can kill
-    # the run mid-epoch). Raise it to reduce SSD writes if you don't need fine resume.
-    training_state_interval = max(1, int(training_config.get("training_state_interval", 1)))
-    # torch.compile only helps when a backend kernel compiler (triton) is available.
-    # On this Windows env triton is absent, so compile measured 0% gain (410.8 vs
-    # 411.5 ms/batch) while adding warmup/recompile overhead and CUDA-graph
-    # fragility. Default off; enable on a triton-capable setup (e.g. Linux).
-    use_torch_compile = bool(training_config.get("use_torch_compile", False))
-    # EMA (exponential moving average of weights). SOTA-standard for detection
-    # (RT-DETR uses decay 0.9999); generalises better and counters overfitting.
-    # Opt-in: best/final checkpoints are saved from the EMA shadow when enabled.
-    use_ema = bool(training_config.get("use_ema", False))
-    ema_decay = float(training_config.get("ema_decay", 0.9999))
-    ema_tau = float(training_config.get("ema_tau", 2000.0))
-    # Class/country-balanced sampling: "off" (default), "class", "country", "both".
-    # Oversamples images with rare classes / from data-poor countries to fight the
-    # imbalance (e.g. pothole/other, Czech). See _build_balanced_sampler.
-    balanced_sampling = str(training_config.get("balanced_sampling", "off")).lower()
-    # Fine-tuning / transfer: initialise weights from an existing checkpoint AFTER the model
-    # is built. Unlike --resume, this loads WEIGHTS ONLY (fresh optimizer/EMA/epoch), so you
-    # can keep training on a different dataset with a new (e.g. lower) learning rate.
-    init_checkpoint = training_config.get("init_checkpoint")
+
+    # --- Checkpoint-selection metric ---
+    # "val_loss" (default, backward compatible): best = min validation loss.
+    # "map_50": best = max mAP@0.5 measured on the val split using EMA weights;
+    # this matches how the model is ultimately evaluated and avoids the
+    # loss-vs-mAP mismatch. Periodic to bound the extra inference cost.
+    checkpoint_metric = str(
+        training_config.get("checkpoint_metric", "val_loss")
+    ).lower()
+    use_map_selection = checkpoint_metric in ("map", "map_50", "map50")
+    eval_interval = max(1, int(training_config.get("eval_interval", 1)))
+    eval_conf = float(
+        config.get("evaluation", {}).get("confidence_threshold", 0.25)
+    )
 
     # Reproducibility seed
     seed = training_config.get("seed", 42)
@@ -999,15 +878,6 @@ def train(config_path: str, verbose: bool = False, resume_from: Optional[str] = 
         model.to(device)
     logger.info("Model moved to %s", device)
 
-    # Fine-tune init: load weights from a prior checkpoint (weights only, no optimizer/epoch).
-    if init_checkpoint:
-        try:
-            model.load_checkpoint(Path(init_checkpoint))
-            logger.info("Initialised weights from checkpoint (fine-tuning): %s", init_checkpoint)
-        except Exception as e:
-            logger.error("Failed to load init_checkpoint '%s': %s", init_checkpoint, e)
-            return {}
-
     # Convert model to channels_last memory format for Tensor Core optimization.
     # Must happen AFTER .to(device) and BEFORE torch.compile (compile traces graph).
     # Best-effort: skip if any op rejects the layout.
@@ -1023,9 +893,20 @@ def train(config_path: str, verbose: bool = False, resume_from: Optional[str] = 
         except Exception as e:
             logger.warning("channels_last conversion failed, continuing in default layout: %s", e)
 
-    # Compile model for faster CUDA execution (torch.compile, requires PyTorch 2.0+
-    # AND a triton backend). Opt-in: measured no benefit without triton on this env.
-    if use_torch_compile and hasattr(torch, "compile") and device.type == "cuda":
+    # Compile model for faster CUDA execution (torch.compile, requires PyTorch 2.0+)
+    # Skipped when either the YAML opts out (``training.use_torch_compile: false``)
+    # or the wrapper declares it doesn't support compilation
+    # (``BaseDetector.supports_torch_compile`` returning False; e.g. torchvision SSD,
+    # whose training-time forward triggers graph breaks from ``.item()`` and
+    # ``random.choice`` inside GeneralizedRCNNTransform).
+    yaml_compile_pref = training_config.get("use_torch_compile", None)
+    if yaml_compile_pref is None:
+        # No explicit YAML preference: defer to the wrapper.
+        wants_compile = bool(model.supports_torch_compile())
+    else:
+        wants_compile = bool(yaml_compile_pref)
+
+    if hasattr(torch, "compile") and device.type == "cuda" and wants_compile:
         try:
             if hasattr(model, "_model") and hasattr(model._model, "model"):
                 model._model.model = torch.compile(model._model.model, mode="reduce-overhead")
@@ -1036,7 +917,20 @@ def train(config_path: str, verbose: bool = False, resume_from: Optional[str] = 
             logger.info("Model compiled with torch.compile (mode=reduce-overhead)")
         except Exception as e:
             logger.warning("torch.compile failed, continuing without compilation: %s", e)
+    elif not wants_compile:
+        reason = (
+            "YAML training.use_torch_compile=false"
+            if yaml_compile_pref is False
+            else f"{type(model).__name__}.supports_torch_compile()=False"
+        )
+        logger.info("Skipping torch.compile (%s)", reason)
 
+
+    # --- Exponential Moving Average of weights ---
+    # Maintains an averaged copy of the weights that is evaluated and
+    # checkpointed instead of the raw training weights (typically +1-3 mAP for
+    # detection). Returns None for wrappers without an underlying nn.Module.
+    ema = create_ema(model)
 
     logger.info("Loading dataset from %s", dataset_path)
     rdd_dataset = RDD2022Dataset(country_filter=country_filter)
@@ -1047,6 +941,39 @@ def train(config_path: str, verbose: bool = False, resume_from: Optional[str] = 
     train_ratio = 1.0 - val_split
     train_ds, val_ds, _ = rdd_dataset.split(train_ratio, val_split, 0.0, seed=seed)
     logger.info("Train: %d, Val: %d", len(train_ds), len(val_ds))
+
+    # --- SR-WBCE class re-weighting (optional) ---
+    # Set model.class_weights from the TRAIN split's per-class instance counts so
+    # Ultralytics' (E2E)DetectLoss up-weights rare classes. Computed after the
+    # split (and after the model is on device) so the rebuilt criterion picks it
+    # up. Class index order matches sorted(get_class_names()) used for targets.
+    loss_cfg = training_config.get("loss", {})
+    if loss_cfg.get("sr_wbce", False):
+        from model.training.class_weights import sr_wbce_weights, count_class_instances
+        sr_n = float(loss_cfg.get("sr_wbce_n", 4))
+        cw_names = train_ds.get_class_names()
+        cw_counts = count_class_instances(train_ds, cw_names)
+        cw_values = sr_wbce_weights(cw_counts, sr_n)
+        underlying = getattr(getattr(model, "_model", None), "model", None)
+        if underlying is not None:
+            underlying.class_weights = torch.tensor(
+                cw_values, dtype=torch.float32, device=device
+            )
+            # Rebuild the criterion so v8/E2E DetectLoss re-reads class_weights.
+            if hasattr(model, "_build_loss_fn"):
+                model._build_loss_fn()
+            elif hasattr(underlying, "init_criterion"):
+                underlying.criterion = underlying.init_criterion()
+            logger.info(
+                "SR-WBCE (n=%.1f) class weighting applied | counts=%s | weights=%s",
+                sr_n,
+                {n: c for n, c in zip(cw_names, cw_counts)},
+                {n: round(w, 3) for n, w in zip(cw_names, cw_values)},
+            )
+        else:
+            logger.warning(
+                "SR-WBCE requested but model has no _model.model; skipping class weighting."
+            )
 
     # Build augmentation pipeline from config (only applied to training set)
     aug_config = training_config.get("augmentation", {})
@@ -1059,29 +986,12 @@ def train(config_path: str, verbose: bool = False, resume_from: Optional[str] = 
     mosaic_off_epochs = int(aug_config.get("mosaic_off_epochs", 0))
     logger.info("Mosaic p=%.2f, MixUp p=%.2f, mosaic_off_epochs=%d", mosaic_p, mixup_p, mosaic_off_epochs)
 
-    # Letterbox: preserve aspect ratio + pad instead of square squish (for non-square
-    # datasets like Norway 4040x2035). Applied to BOTH train and val for consistency.
-    use_letterbox = bool(training_config.get("letterbox", False))
-    if use_letterbox:
-        logger.info("Letterbox resize ENABLED (preserve aspect ratio + grey pad)")
-
     # Create PyTorch datasets
     train_torch = RDD2022TorchDataset(
         train_ds, input_size=input_size, augmentation=augmentation_pipeline,
-        mosaic=mosaic_p, mixup=mixup_p, letterbox=use_letterbox,
+        mosaic=mosaic_p, mixup=mixup_p,
     )
-    val_torch = RDD2022TorchDataset(val_ds, input_size=input_size, letterbox=use_letterbox)  # No augmentation for validation
-
-    # --- Class/country-balanced sampling (optional) ---
-    train_sampler = None
-    if balanced_sampling in ("class", "country", "both"):
-        train_sampler, _bal_stats = _build_balanced_sampler(
-            train_torch._annotations, balanced_sampling
-        )
-        logger.info(
-            "Balanced sampling = '%s' | images/class=%s | images/country=%s",
-            balanced_sampling, _bal_stats["class_img_count"], _bal_stats["country_img_count"],
-        )
+    val_torch = RDD2022TorchDataset(val_ds, input_size=input_size)  # No augmentation for validation
 
     # On Windows, DataLoader workers require explicit spawn context
     is_windows = platform.system() == "Windows"
@@ -1095,18 +1005,12 @@ def train(config_path: str, verbose: bool = False, resume_from: Optional[str] = 
     train_loader = torch.utils.data.DataLoader(
         train_torch,
         batch_size=batch_size,
-        shuffle=train_sampler is None,   # shuffle XOR sampler (PyTorch forbids both)
-        sampler=train_sampler,
+        shuffle=True,
         num_workers=effective_workers,
         pin_memory=True,
         persistent_workers=effective_workers > 0,
         multiprocessing_context=mp_context,
         collate_fn=collate_fn,
-        # Drop the ragged final batch so every step has a fixed batch dimension.
-        # This keeps torch.compile / CUDA-graph captures from re-tracing on the
-        # last (smaller) batch each epoch, and avoids BatchNorm on a tiny batch.
-        # Cost: up to batch_size-1 images skipped per epoch (~0.03% of train).
-        drop_last=True,
         **prefetch_kwargs,
     )
     val_loader = torch.utils.data.DataLoader(
@@ -1122,49 +1026,60 @@ def train(config_path: str, verbose: bool = False, resume_from: Optional[str] = 
     )
 
     # --- Construct optimizer from model.get_parameters() ---
-    params = model.get_parameters()
-    if optimizer_name.upper() == "SGD":
-        optimizer = torch.optim.SGD(
-            params, lr=learning_rate, momentum=momentum, weight_decay=weight_decay
-        )
-    elif optimizer_name.upper() == "ADAM":
-        optimizer = torch.optim.Adam(params, lr=learning_rate, weight_decay=weight_decay)
-    elif optimizer_name.upper() == "ADAMW":
-        optimizer = torch.optim.AdamW(params, lr=learning_rate, weight_decay=weight_decay)
-    elif optimizer_name.upper() == "MUSGD":
-        try:
-            from ultralytics.optim.muon import MuSGD
-            # MuSGD needs parameter groups: use_muon=True only for ndim >= 2
-            muon_params = []
-            sgd_params = []
-            for p in params:
-                if p.ndim >= 2:
-                    muon_params.append(p)
-                else:
-                    sgd_params.append(p)
-            param_groups = [
-                {"params": muon_params, "use_muon": True},
-                {"params": sgd_params, "use_muon": False},
-            ]
-            optimizer = MuSGD(
-                param_groups, lr=learning_rate, momentum=momentum,
-                weight_decay=weight_decay, nesterov=True,
-                muon=0.2, sgd=1.0,
-            )
-            logger.info("Using MuSGD optimizer (Muon + SGD hybrid)")
-        except ImportError:
-            logger.warning(
-                "MuSGD requested but ultralytics is not installed. Falling back to SGD."
-            )
-            optimizer = torch.optim.SGD(
+    def _build_optimizer():
+        """Construct an optimizer using the model's current parameter set.
+
+        Factored out so the training loop can rebuild the optimizer mid-training
+        when the model toggles ``requires_grad`` (e.g. unfreezing a backbone
+        after ``freeze_backbone_epochs``). PyTorch optimizers do not pick up
+        newly-enabled parameters once constructed.
+        """
+        params = model.get_parameters()
+        if optimizer_name.upper() == "SGD":
+            return torch.optim.SGD(
                 params, lr=learning_rate, momentum=momentum, weight_decay=weight_decay
             )
-    else:
-        # Fallback to SGD for unknown optimizer values
-        logger.warning("Unknown optimizer '%s', falling back to SGD", optimizer_name)
-        optimizer = torch.optim.SGD(
-            params, lr=learning_rate, momentum=momentum, weight_decay=weight_decay
-        )
+        elif optimizer_name.upper() == "ADAM":
+            return torch.optim.Adam(params, lr=learning_rate, weight_decay=weight_decay)
+        elif optimizer_name.upper() == "ADAMW":
+            return torch.optim.AdamW(params, lr=learning_rate, weight_decay=weight_decay)
+        elif optimizer_name.upper() == "MUSGD":
+            try:
+                from ultralytics.optim.muon import MuSGD
+                # MuSGD needs parameter groups: use_muon=True only for ndim >= 2
+                muon_params = []
+                sgd_params = []
+                for p in params:
+                    if p.ndim >= 2:
+                        muon_params.append(p)
+                    else:
+                        sgd_params.append(p)
+                param_groups = [
+                    {"params": muon_params, "use_muon": True},
+                    {"params": sgd_params, "use_muon": False},
+                ]
+                opt = MuSGD(
+                    param_groups, lr=learning_rate, momentum=momentum,
+                    weight_decay=weight_decay, nesterov=True,
+                    muon=0.2, sgd=1.0,
+                )
+                logger.info("Using MuSGD optimizer (Muon + SGD hybrid)")
+                return opt
+            except ImportError:
+                logger.warning(
+                    "MuSGD requested but ultralytics is not installed. Falling back to SGD."
+                )
+                return torch.optim.SGD(
+                    params, lr=learning_rate, momentum=momentum, weight_decay=weight_decay
+                )
+        else:
+            # Fallback to SGD for unknown optimizer values
+            logger.warning("Unknown optimizer '%s', falling back to SGD", optimizer_name)
+            return torch.optim.SGD(
+                params, lr=learning_rate, momentum=momentum, weight_decay=weight_decay
+            )
+
+    optimizer = _build_optimizer()
 
     # --- Learning rate scheduler: cosine annealing (stepped only after warmup) ---
     cosine_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
@@ -1177,17 +1092,6 @@ def train(config_path: str, verbose: bool = False, resume_from: Optional[str] = 
         logger.info("Mixed precision training (AMP) enabled")
     else:
         logger.info("Mixed precision training (AMP) disabled, using full precision")
-
-    # --- EMA (exponential moving average of weights) ---
-    # Created from the (device-resident) model so the shadow lives on the same
-    # device. Must exist before the resume block so its shadow can be restored.
-    ema = None
-    if use_ema:
-        ema = ModelEMA(model, decay=ema_decay, tau=ema_tau)
-        logger.info(
-            "EMA enabled (decay=%.5f, tau=%.0f); best/final checkpoints use EMA weights",
-            ema_decay, ema_tau,
-        )
 
     # --- SIGINT handling ---
     interrupted = False
@@ -1219,20 +1123,10 @@ def train(config_path: str, verbose: bool = False, resume_from: Optional[str] = 
         else:
             model.save_checkpoint(path)
 
-    def _save_eval_checkpoint(path: Path, optimizer_obj=None, epoch_num=None, metrics_dict=None):
-        """Save the checkpoint used for inference/eval (best/recovery/final).
-
-        Uses the EMA shadow weights when EMA is enabled (they generalise better);
-        otherwise falls back to the live model weights via ``_save_checkpoint``.
-        """
-        if ema is not None:
-            ema.save(path)
-        else:
-            _save_checkpoint(path, optimizer_obj=optimizer_obj, epoch_num=epoch_num, metrics_dict=metrics_dict)
-
     # --- Resume handling ---
     start_epoch = 0
     best_val_loss = float("inf")
+    best_map = -1.0  # best mAP@0.5 seen (used when checkpoint_metric == map_50)
     best_epoch = 0
     epochs_without_improvement = 0
 
@@ -1240,11 +1134,15 @@ def train(config_path: str, verbose: bool = False, resume_from: Optional[str] = 
         try:
             resume_path = _resolve_resume_path(resume_from, checkpoint_dir, model_type)
             logger.info("Loading resume state from: %s", resume_path)
-            state = _load_training_state(resume_path, model, optimizer, cosine_scheduler, scaler, device, ema)
+            state = _load_training_state(
+                resume_path, model, optimizer, cosine_scheduler, scaler, device, ema=ema
+            )
             run_id = state.get("run_id")
             if run_id:
                 start_epoch = state["epoch"] + 1
                 best_val_loss = state["best_val_loss"]
+                if state.get("best_map") is not None:
+                    best_map = state["best_map"]
                 best_epoch = state["best_epoch"]
                 epochs_without_improvement = state["epochs_without_improvement"]
                 run_checkpoint_dir = Path(checkpoint_dir) / run_id
@@ -1282,6 +1180,27 @@ def train(config_path: str, verbose: bool = False, resume_from: Optional[str] = 
         for epoch in range(start_epoch, epochs):
             epoch_start = time.time()
 
+            # --- Per-epoch model hook (e.g. backbone freeze/unfreeze) ---
+            model.on_epoch_start(epoch)
+            if model.requires_optimizer_rebuild():
+                logger.info(
+                    "Epoch %d: rebuilding optimizer because model parameter set changed.",
+                    epoch + 1,
+                )
+                optimizer = _build_optimizer()
+                # Rebuild scheduler too so its internal LR state matches the
+                # new optimizer instance. Use the remaining post-warmup
+                # epochs as T_max so cosine decay continues smoothly.
+                remaining = max(epochs - max(epoch, warmup_epochs), 1)
+                cosine_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+                    optimizer, T_max=remaining, eta_min=learning_rate * 0.01
+                )
+                # Re-create the AMP grad scaler too: scaler state is tied to
+                # the optimizer's param refs only loosely, but we keep it
+                # consistent for clarity.
+                scaler = torch.amp.GradScaler('cuda', enabled=use_amp)
+                model.acknowledge_optimizer_rebuild()
+
             # --- Mosaic off for final N epochs (fine-tune on clean images) ---
             if mosaic_off_epochs > 0 and epoch >= (epochs - mosaic_off_epochs):
                 if train_torch._mosaic_enabled:
@@ -1306,15 +1225,9 @@ def train(config_path: str, verbose: bool = False, resume_from: Optional[str] = 
             train_batches = 0
 
             for batch_idx, (images, targets) in enumerate(train_loader):
-                # Stop promptly once a SIGINT has been received, before fetching more
-                # batches (on Windows that fetch can raise if the workers were killed).
-                if interrupted:
-                    break
-                # Move data to device. non_blocking=True overlaps the H2D copy with
-                # compute (the loaders use pin_memory=True), instead of blocking on
-                # each transfer. Negligible here while compute-bound, but free.
-                images = [img.to(device, non_blocking=True) for img in images]
-                targets = [{k: v.to(device, non_blocking=True) for k, v in t.items()} for t in targets]
+                # Move data to device
+                images = [img.to(device) for img in images]
+                targets = [{k: v.to(device) for k, v in t.items()} for t in targets]
 
                 optimizer.zero_grad()
 
@@ -1352,9 +1265,8 @@ def train(config_path: str, verbose: bool = False, resume_from: Optional[str] = 
                 scaler.step(optimizer)
                 scaler.update()
 
-                # Update EMA shadow after the weights changed
-                if ema is not None:
-                    ema.update(model)
+                # Update the EMA of weights after every optimizer step.
+                update_ema(ema, model)
 
                 train_loss_sum += loss_tensor.item()
                 train_batches += 1
@@ -1374,37 +1286,51 @@ def train(config_path: str, verbose: bool = False, resume_from: Optional[str] = 
             # Compute epoch training metrics
             avg_train_loss = train_loss_sum / max(train_batches, 1)
 
-            # On interrupt, stop before validation/checkpointing: the val DataLoader
-            # workers may already be dead (SIGINT kills spawn workers) and a partial
-            # validation would yield a misleading val_loss / false "best". Resume uses
-            # the previous epoch's training_state.pt (now saved every epoch).
-            if interrupted:
-                logger.info("Interrupted during epoch %d; stopping before validation.", epoch + 1)
-                break
-
             # --- Validation phase ---
+            # All validation runs under the EMA weights (ema_weights is a no-op
+            # when EMA is unavailable), so both val_loss and mAP reflect the
+            # averaged weights that will be checkpointed.
             model.set_eval_mode()
             val_loss_sum = 0.0
             val_batches = 0
+            val_map = None
 
-            with torch.no_grad():
-                for images, targets in val_loader:
-                    images = [img.to(device, non_blocking=True) for img in images]
-                    targets = [{k: v.to(device, non_blocking=True) for k, v in t.items()} for t in targets]
+            # Validation loss under the EMA weights (state-dict swap; train_step
+            # uses the training-forward path which does NOT fuse Conv+BN).
+            with ema_weights(model, ema):
+                with torch.no_grad():
+                    for images, targets in val_loader:
+                        images = [img.to(device) for img in images]
+                        targets = [{k: v.to(device) for k, v in t.items()} for t in targets]
 
-                    try:
-                        loss_dict = model.train_step(images, targets)
-                        loss_tensor = loss_dict["loss_tensor"]
-                        if loss_tensor.item() == 0.0:
+                        try:
+                            loss_dict = model.train_step(images, targets)
+                            loss_tensor = loss_dict["loss_tensor"]
+                            if loss_tensor.item() == 0.0:
+                                continue
+                            val_loss_sum += loss_tensor.item()
+                            val_batches += 1
+                        except Exception as e:
+                            logger.warning(
+                                "Exception in validation train_step at epoch %d: %s. Skipping batch.",
+                                epoch, e,
+                            )
                             continue
-                        val_loss_sum += loss_tensor.item()
-                        val_batches += 1
-                    except Exception as e:
-                        logger.warning(
-                            "Exception in validation train_step at epoch %d: %s. Skipping batch.",
-                            epoch, e,
-                        )
-                        continue
+
+            # Periodic mAP@0.5 evaluation on the val split (only when selecting
+            # checkpoints by mAP). Always evaluate the final epoch. Runs on a
+            # fusion-isolated deep copy so it never corrupts the training model.
+            if use_map_selection and (
+                (epoch + 1) % eval_interval == 0 or epoch == epochs - 1
+            ):
+                try:
+                    val_map = _evaluate_val_map(
+                        model, ema, val_loader, num_classes, eval_conf, device
+                    )
+                except Exception as e:
+                    logger.warning(
+                        "Per-epoch mAP eval failed at epoch %d: %s", epoch + 1, e
+                    )
 
             avg_val_loss = val_loss_sum / max(val_batches, 1)
 
@@ -1412,8 +1338,11 @@ def train(config_path: str, verbose: bool = False, resume_from: Optional[str] = 
             completed_epochs = epoch + 1
 
             logger.info(
-                "Epoch %d/%d complete | Train Loss: %.4f | Val Loss: %.4f | Time: %.1fs | LR: %.6f",
-                epoch + 1, epochs, avg_train_loss, avg_val_loss, epoch_time, current_lr,
+                "Epoch %d/%d complete | Train Loss: %.4f | Val Loss: %.4f | "
+                "mAP@0.5: %s | Time: %.1fs | LR: %.6f",
+                epoch + 1, epochs, avg_train_loss, avg_val_loss,
+                ("%.4f" % val_map) if val_map is not None else "n/a",
+                epoch_time, current_lr,
             )
 
             # --- Experiment tracking: log metrics per epoch ---
@@ -1423,6 +1352,8 @@ def train(config_path: str, verbose: bool = False, resume_from: Optional[str] = 
                 "learning_rate": current_lr,
                 "epoch_time_s": epoch_time,
             }
+            if val_map is not None:
+                epoch_metrics["map_50"] = val_map
             try:
                 tracker.log_metrics(run_id, step=epoch, metrics=epoch_metrics)
             except Exception as e:
@@ -1433,29 +1364,54 @@ def train(config_path: str, verbose: bool = False, resume_from: Optional[str] = 
                 "train_loss": avg_train_loss,
                 "val_loss": avg_val_loss,
             }
+            if val_map is not None:
+                current_metrics["map_50"] = val_map
 
-            # Best checkpoint: save when val_loss improves
-            if avg_val_loss < best_val_loss:
-                best_val_loss = avg_val_loss
+            # Decide whether this epoch is the new best by the configured metric.
+            # In map_50 mode, only epochs that were actually evaluated count
+            # (so early-stopping patience advances in eval_interval units).
+            if use_map_selection:
+                measured = val_map is not None
+                improved = measured and (val_map > best_map)
+            else:
+                measured = True
+                improved = avg_val_loss < best_val_loss
+
+            if improved:
                 best_epoch = epoch + 1  # 1-indexed
                 epochs_without_improvement = 0
+                if use_map_selection:
+                    best_map = val_map
+                else:
+                    best_val_loss = avg_val_loss
                 try:
-                    _save_eval_checkpoint(
-                        run_checkpoint_dir / "best_model.pt",
-                        optimizer_obj=optimizer,
-                        epoch_num=epoch,
-                        metrics_dict=current_metrics,
+                    # Save the EMA weights as the best checkpoint.
+                    with ema_weights(model, ema):
+                        _save_checkpoint(
+                            run_checkpoint_dir / "best_model.pt",
+                            optimizer_obj=optimizer,
+                            epoch_num=epoch,
+                            metrics_dict=current_metrics,
+                        )
+                    logger.info(
+                        "Saved best model checkpoint (%s)",
+                        "mAP@0.5=%.4f" % best_map
+                        if use_map_selection
+                        else "val_loss=%.4f" % best_val_loss,
                     )
-                    logger.info("Saved best model checkpoint (val_loss=%.4f)", avg_val_loss)
                 except (IOError, OSError) as e:
                     logger.warning("Failed to save best checkpoint: %s", e)
-            else:
+            elif measured:
                 epochs_without_improvement += 1
+
+            # Keep best_val_loss current for logging/metadata even in map mode.
+            if use_map_selection and avg_val_loss < best_val_loss:
+                best_val_loss = avg_val_loss
 
             # Recovery checkpoint: every 5 epochs (1-indexed, so epoch+1 % 5 == 0)
             if (epoch + 1) % 5 == 0:
                 try:
-                    _save_eval_checkpoint(
+                    _save_checkpoint(
                         run_checkpoint_dir / "recovery.pt",
                         optimizer_obj=optimizer,
                         epoch_num=epoch,
@@ -1465,33 +1421,31 @@ def train(config_path: str, verbose: bool = False, resume_from: Optional[str] = 
                 except (IOError, OSError) as e:
                     logger.warning("Failed to save recovery checkpoint: %s", e)
 
-            # Training state (for resume): written every `training_state_interval`
-            # epochs, plus on the last epoch, on early-stop, and on interrupt. The
-            # file is ~286 MB for RT-DETR; writing it every epoch previously stalled
-            # the GPU on synchronous I/O for no benefit while compute-bound.
-            should_save_state = (
-                (epoch + 1) % training_state_interval == 0
-                or (epoch + 1) == epochs
-                or interrupted
-                or epochs_without_improvement >= early_stopping_patience
-            )
-            if should_save_state:
-                try:
-                    _save_training_state(
-                        run_checkpoint_dir / "training_state.pt",
-                        model, optimizer, cosine_scheduler, scaler,
-                        epoch, best_val_loss, best_epoch, epochs_without_improvement,
-                        run_id, config, ema,
-                    )
-                except (IOError, OSError) as e:
-                    logger.warning("Failed to save training state: %s", e)
+            # Training state (always, for resume): overwritten each epoch.
+            # Saves the LIVE training weights (+ optimizer/scaler/EMA state) so
+            # resume continues optimisation; the EMA weights ride along
+            # separately and are restored into the EMA tracker on resume.
+            try:
+                _save_training_state(
+                    run_checkpoint_dir / "training_state.pt",
+                    model, optimizer, cosine_scheduler, scaler,
+                    epoch, best_val_loss, best_epoch, epochs_without_improvement,
+                    run_id, config, ema=ema, best_map=best_map,
+                )
+            except (IOError, OSError) as e:
+                logger.warning("Failed to save training state: %s", e)
 
             # --- Early stopping check ---
             if epochs_without_improvement >= early_stopping_patience:
+                best_desc = (
+                    "mAP@0.5=%.4f" % best_map
+                    if use_map_selection
+                    else "val_loss=%.4f" % best_val_loss
+                )
                 logger.info(
                     "Early stopping triggered: no improvement for %d epochs. "
-                    "Best val_loss=%.4f at epoch %d (patience=%d)",
-                    epochs_without_improvement, best_val_loss, best_epoch, early_stopping_patience,
+                    "Best %s at epoch %d (patience=%d)",
+                    epochs_without_improvement, best_desc, best_epoch, early_stopping_patience,
                 )
                 break
 
@@ -1503,17 +1457,6 @@ def train(config_path: str, verbose: bool = False, resume_from: Optional[str] = 
     except KeyboardInterrupt:
         # Second SIGINT caused immediate termination
         logger.warning("Training forcefully interrupted (double SIGINT)")
-
-    except RuntimeError as e:
-        # On Windows, Ctrl-C kills the DataLoader (spawn) workers, which surfaces here
-        # as "DataLoader worker exited unexpectedly" from the batch fetch. Treat it as
-        # a graceful stop when we're already interrupting; re-raise genuine errors
-        # (e.g. CUDA OOM) so they still surface. The last completed epoch's
-        # training_state.pt (saved every epoch) is the resume point.
-        if interrupted:
-            logger.info("Training stopped after interrupt (DataLoader workers exited).")
-        else:
-            raise
 
     finally:
         # --- End experiment tracking (always, even on interrupt/crash) ---
@@ -1533,17 +1476,20 @@ def train(config_path: str, verbose: bool = False, resume_from: Optional[str] = 
             logger.warning("Failed to end experiment run: %s", e)
 
     # --- Final checkpoint ---
+    # Saved with EMA weights (the inference-quality artifact), consistent with
+    # best_model.pt.
     final_metrics_dict = {
         "train_loss": avg_train_loss,
         "val_loss": avg_val_loss,
     }
     try:
-        _save_eval_checkpoint(
-            run_checkpoint_dir / "final_model.pt",
-            optimizer_obj=optimizer,
-            epoch_num=completed_epochs - 1 if completed_epochs > 0 else 0,
-            metrics_dict=final_metrics_dict,
-        )
+        with ema_weights(model, ema):
+            _save_checkpoint(
+                run_checkpoint_dir / "final_model.pt",
+                optimizer_obj=optimizer,
+                epoch_num=completed_epochs - 1 if completed_epochs > 0 else 0,
+                metrics_dict=final_metrics_dict,
+            )
         logger.info("Saved final model checkpoint")
     except (IOError, OSError) as e:
         logger.error("Failed to save final checkpoint: %s", e)

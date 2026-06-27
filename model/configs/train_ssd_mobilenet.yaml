@@ -1,46 +1,146 @@
-name: rdd2022_ssd_mobilenetv3
+name: rdd2022_ssd_mobilenetv3_large
+
+# SSDLite + MobileNetV3-Large baseline for RDD2022.
+#
+# This configuration follows the recipe used by SSD-MobileNet / MobileNetV3
+# papers on road damage detection (NOT the from-scratch COCO recipe of
+# Howard et al. 2019, which is inappropriate for fine-tuning on a small
+# domain-specific dataset).
+#
+# Convergent practice across the RDD-MobileNet literature:
+#
+#   1. Maeda et al. 2018, "Road damage detection and classification using
+#      deep neural networks with smartphone images" - SSD-Inception-V2 and
+#      SSD-MobileNet on RDD2018, Adam optimiser with lr ~1e-3, batch 16-32,
+#      modest geometric augmentation, ImageNet normalisation.
+#
+#   2. Hasan & Ahmed 2024, "Improving Road Safety through Deep
+#      Learning-based Approaches for Road Damage Detection and
+#      Classification" - RDD2020/RDD2022, multiple backbones including
+#      MobileNetV3, Adam with batch 4. The strict reproduction of this
+#      recipe lives in train_ssd_mobilenet_paper.yaml.
+#
+#   3. RDD2022 YOLOv11 + MobileNetV3 + ECA (Indonesian roads, 2024) -
+#      Adam lr=1e-3, batch 16, 100 epochs.
+#
+#   4. MN-YOLOv5 / LE-YOLOv5 (RDD2020, 2023) - MobileNetV3 backbone with
+#      Coordinate Attention, KMeans-tuned anchors, label smoothing; these
+#      are YOLO-specific modifications that do not transfer to SSDLite,
+#      but the freeze->unfreeze schedule used here is motivated by the
+#      transfer-learning pattern these papers adopt.
+#
+# Deliberate deviations from the strict RDD literature, motivated by
+# engineering best practice:
+#
+#   * AdamW (not Adam) - cleaner decoupled weight-decay handling;
+#     equivalent or better than Adam at the same hyperparameters.
+#   * Discriminative learning rates (backbone_lr << head_lr) - the SSDLite
+#     head is initialised from scratch (no 640-input COCO weights exist)
+#     and benefits from a higher LR, while the ImageNet-pretrained
+#     backbone wants gentler updates to preserve learned features. The
+#     freeze_backbone_epochs=10 window protects the backbone during head
+#     warm-up; discriminative LR takes over from epoch 10 onward after
+#     the optimiser is rebuilt by the trainer.
+#
+# Architectural choices:
+#
+#   * input_size: 640 (matches YOLO26 / RT-DETR for direct comparison).
+#     The wrapper builds the SSDLite head and anchor generator dynamically
+#     at 640x640. Anchor ratios follow torchvision's SSDLite defaults; for
+#     a future ablation, KMeans-tuned anchors over RDD2022 box dimensions
+#     would target the prevalent long-skinny longitudinal-crack boxes.
+#   * num_classes: 5 - this is the count of *damage* classes. The wrapper
+#     internally adds +1 for the torchvision background class (so the
+#     underlying SSD head has 6 logits per anchor) and shifts dataset
+#     labels by +1 inside train_step. The dataset adapter keeps emitting
+#     0-indexed labels in [0, 4].
+#   * country_filter matches train_yolo26.yaml exactly. Removing it would
+#     make MobileNet trained on a *different* dataset slice than YOLO26,
+#     breaking the comparison. Both models must train on the same data.
 
 model:
   type: ssd_mobilenetv3
   config:
     input_size: 640
-    num_classes: 5
+    num_classes: 5                    # 5 damage classes; +1 background added internally
+    pretrained_backbone: true
+    trainable_backbone_layers: 6      # full backbone trainable after unfreeze
+    confidence_threshold: 0.25        # metadata for downstream P/R/F1 ops; NOT applied in forward()
+    score_threshold: 0.001            # low cut for mAP integration (torchvision default)
+    nms_threshold: 0.5
+    detections_per_image: 300
+    topk_candidates: 300
+    freeze_backbone_epochs: 10        # stage-1 head-only fine-tune length
+    # Discriminative LR (active from epoch 10 onward, after backbone unfreezes
+    # and optimiser is rebuilt). Backbone gets 10x lower LR than head; the
+    # 10-epoch backbone freeze prevents discriminative LR from being misapplied
+    # during the 3-epoch warmup window.
+    backbone_lr: 0.0001
+    head_lr: 0.001
 
 dataset:
   type: rdd2022
   path: model/data/rdd2022/complete
-  data_yaml: model/data/rdd2022/complete_yolo/data.yaml
-  # To use sample dataset:
-  # path: model/data/rdd2022/sample
-  # data_yaml: model/data/rdd2022/sample_yolo/data.yaml
-  # Uncomment to filter by country:
-  # country_filter: [Japan, India, Czech]
   class_mapping: model/configs/rdd2022_classes.yaml
+  # MUST match train_yolo26.yaml / train_rt_detr.yaml for apples-to-apples
+  # comparison. Norway and China are excluded across all baselines.
+  country_filter: [Japan, India, Czech, United States]
 
 training:
-  epochs: 50
-  early_stopping_patience: 10
-  batch_size: 64
+  epochs: 100                         # RDD-typical fine-tune length
+  early_stopping_patience: 15
+  batch_size: 32                      # ~5 GiB peak on a 6 GiB GPU with AMP
   num_workers: 8
+  prefetch_factor: 3
   use_amp: true
-  learning_rate: 0.01
-  optimizer: SGD
-  weight_decay: 0.0005
-  momentum: 0.9
+  use_channels_last: false
+  # head_lr is also passed here as the trainer's reference LR (used for
+  # warmup ramp and cosine eta_min calculation). Per-group LRs from
+  # model.config.{backbone_lr, head_lr} take precedence inside the optimiser.
+  learning_rate: 0.001
+  optimizer: AdamW
+  weight_decay: 0.00005               # Adam-fine-tune-typical (5e-5)
   scheduler: cosine
-  warmup_epochs: 3
+  warmup_epochs: 3                    # < freeze_backbone_epochs to keep discrim-LR safe
   val_split: 0.2
-  checkpoint_dir: ./checkpoints/ssd_mobilenetv3
+  checkpoint_dir: ./checkpoints/ssd_mobilenetv3_large
   log_interval: 25
+  seed: 42
+  augmentation:
+    # SSD-paper geometric augmentation (RandomIoUCrop + RandomHorizontalFlip)
+    # plus modest photometric jitter calibrated for road imagery. Mosaic /
+    # MixUp are NOT used: they are YOLO-family additions absent from the
+    # SSD literature, and destabilise hard-negative mining.
+    mosaic: 0.0
+    mixup: 0.0
+    horizontal_flip: true             # SSD RandomHorizontalFlip
+    vertical_flip: false              # road geometry doesn't invert
+    # Photometric: narrower than COCO PhotometricDistort because road
+    # imagery has lower saturation/value variance.
+    hsv_h: 0.015
+    hsv_s: 0.3
+    hsv_v: 0.3
+    # Conservative scale jitter. Aggressive zoom-out ([0.5, 1.5]) shrinks
+    # thin cracks below the model's smallest anchor and hurts recall.
+    # A separate ablation (M1 in the experiment table) can probe [0.5, 1.5]
+    # to verify whether wider scale jitter improves pothole AP at the cost
+    # of crack recall.
+    scale: [0.75, 1.25]
+    # Small translation for camera-position robustness (smartphone-mounted
+    # cameras shift between vehicles).
+    translate: 0.05
+    random_iou_crop: true             # SSD RandomIoUCrop - essential for SSD
 
 evaluation:
-  iou_thresholds: [0.5]
-  confidence_threshold: 0.3
-  # F1-sweep operating points (Phase-2 evaluation architecture). Required.
+  # mAP@0.5 and mAP@[0.5:0.95] are reported automatically by compute_map
+  # regardless of iou_thresholds. This list controls the per-IoU
+  # precision/recall/F1 breakdown used for the per-IoU thesis table.
+  iou_thresholds: [0.5, 0.55, 0.6, 0.65, 0.7, 0.75, 0.8, 0.85, 0.9, 0.95]
+  confidence_threshold: 0.25
   confidence_thresholds_sweep:
     [0.05, 0.10, 0.15, 0.20, 0.25, 0.30, 0.35, 0.40, 0.45, 0.50]
 
 output:
-  checkpoint_dir: ./checkpoints/ssd_mobilenetv3
-  results_dir: ./checkpoints/ssd_mobilenetv3
-  log_dir: ./logs/ssd_mobilenetv3
+  checkpoint_dir: ./checkpoints/ssd_mobilenetv3_large
+  results_dir: ./checkpoints/ssd_mobilenetv3_large
+  log_dir: ./logs/ssd_mobilenetv3_large
