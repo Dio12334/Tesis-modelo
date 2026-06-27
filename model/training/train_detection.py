@@ -600,7 +600,13 @@ def _set_model_state_dict(model, state_dict):
 def _save_training_state(path, model, optimizer, scheduler, scaler, epoch,
                          best_val_loss, best_epoch, epochs_without_improvement,
                          run_id, config_used, ema=None, best_map=None):
-    """Save full training state (model + optimizer + scheduler + metadata) for resume."""
+    """Save full training state (model + optimizer + scheduler + metadata) for resume.
+
+    Saves the *live* (raw) model weights so resume continues optimization from
+    the true training trajectory. EMA weights are persisted separately under
+    ``ema_state_dict`` and ``ema_updates`` so the moving-average state also
+    survives resumes. ``best_map`` is included for map_50-based model selection.
+    """
     state = {
         "model_state_dict": _get_model_state_dict(model),
         "optimizer_state_dict": optimizer.state_dict(),
@@ -1087,7 +1093,7 @@ def train(config_path: str, verbose: bool = False, resume_from: Optional[str] = 
     )
 
     # --- Mixed precision training (AMP) ---
-    scaler = torch.amp.GradScaler('cuda', enabled=use_amp)
+    scaler = torch.amp.GradScaler(device.type, enabled=use_amp and device.type == "cuda")
     if use_amp:
         logger.info("Mixed precision training (AMP) enabled")
     else:
@@ -1198,7 +1204,10 @@ def train(config_path: str, verbose: bool = False, resume_from: Optional[str] = 
                 # Re-create the AMP grad scaler too: scaler state is tied to
                 # the optimizer's param refs only loosely, but we keep it
                 # consistent for clarity.
-                scaler = torch.amp.GradScaler('cuda', enabled=use_amp)
+                scaler = torch.amp.GradScaler(
+                    device.type,
+                    enabled=use_amp and device.type == "cuda",
+                )
                 model.acknowledge_optimizer_rebuild()
 
             # --- Mosaic off for final N epochs (fine-tune on clean images) ---

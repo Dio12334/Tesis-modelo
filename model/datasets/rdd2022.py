@@ -314,14 +314,21 @@ class RDD2022Dataset(BaseDataset):
         Returns:
             Country name or empty string if not found.
         """
-        country_tags = {
-            "Japan", "India", "Czech", "Norway", "United States",
-            "China_Drone", "China_MotorBike",
+        # Maps raw tag names (as stored in Supervisely JSON) to the normalized
+        # country strings used by _extract_country (underscore, no spaces).
+        country_tag_map = {
+            "Japan": "Japan",
+            "India": "India",
+            "Czech": "Czech",
+            "Norway": "Norway",
+            "United States": "United_States",
+            "China_Drone": "China_Drone",
+            "China_MotorBike": "China_MotorBike",
         }
         for tag in tags:
             tag_name = tag.get("name", "")
-            if tag_name in country_tags:
-                return tag_name
+            if tag_name in country_tag_map:
+                return country_tag_map[tag_name]
         return ""
 
     # ------------------------------------------------------------------

@@ -7,7 +7,9 @@ using Plotly interactive charts.
 import streamlit as st
 import plotly.graph_objects as go
 
-from data_loader import ExperimentRun
+from typing import Optional
+
+from data_loader import EvaluationReport, ExperimentRun
 
 
 def render_loss_chart(run: ExperimentRun) -> None:
@@ -154,3 +156,60 @@ def render_learning_rate_chart(run: ExperimentRun) -> None:
     )
 
     st.plotly_chart(fig, width='stretch')
+
+
+def render_threshold_sweep_chart(report: Optional[EvaluationReport]) -> None:
+    """Render Precision / Recall / F1 vs confidence threshold from the evaluation sweep."""
+    if report is None:
+        return
+
+    sweep = (report.metrics or {}).get("f1_sweep")
+    if not sweep:
+        st.info("No hay datos de sweep de confidence threshold disponibles.")
+        return
+
+    confs = [pt["confidence"] for pt in sweep]
+    precisions = [pt["precision"] for pt in sweep]
+    recalls = [pt["recall"] for pt in sweep]
+    f1s = [pt["f1"] for pt in sweep]
+
+    fig = go.Figure()
+
+    for y_vals, name, color in [
+        (precisions, "Precision", "#1f77b4"),
+        (recalls, "Recall", "#ff7f0e"),
+        (f1s, "F1", "#2ca02c"),
+    ]:
+        fig.add_trace(
+            go.Scatter(
+                x=confs,
+                y=y_vals,
+                mode="lines+markers",
+                name=name,
+                line=dict(color=color, width=2),
+                marker=dict(size=7),
+                hovertemplate=f"{name}: %{{y:.4f}}<br>conf: %{{x:.2f}}<extra></extra>",
+            )
+        )
+
+    best = (report.metrics or {}).get("best_f1")
+    if best:
+        fig.add_vline(
+            x=best["confidence"],
+            line_dash="dash",
+            line_color="gray",
+            annotation_text=f"best F1 = {best['f1']:.3f} @ {best['confidence']}",
+            annotation_position="top right",
+        )
+
+    fig.update_layout(
+        title="Precision / Recall / F1 vs Confidence Threshold",
+        xaxis_title="Confidence Threshold",
+        yaxis_title="Score",
+        yaxis=dict(range=[0, 1]),
+        hovermode="x unified",
+        template="plotly_white",
+        height=420,
+        legend=dict(yanchor="top", y=0.99, xanchor="left", x=0.01),
+    )
+    st.plotly_chart(fig, use_container_width=True)

@@ -1,0 +1,84 @@
+name: rdd2022_rt_detr_l_v2_RC
+
+# Experimento C (balanceo por clase) sobre R. ÚNICO cambio vs R (atribución limpia):
+#   balanced_sampling: class   (WeightedRandomSampler, peso ∝ 1/sqrt(n_img de la clase))
+# Hipótesis: oversamplear imágenes con clases raras (bache 0.541, transversal 0.598)
+# sube su AP -> sube el mAP@0.5 (promedio macro por clase). Baseline = R (0.6420).
+# Todo lo demás IDÉNTICO a R (incl. weight_decay 5e-4 + random_erasing 0.3).
+
+model:
+  type: rt_detr
+  config:
+    model_size: "l"
+    input_size: 768
+    num_classes: 5
+    confidence_threshold: 0.5
+    iou_threshold: 0.5
+    backbone_layers: 10
+    backbone_lr: 0.00001
+    head_lr: 0.0001
+
+dataset:
+  type: rdd2022
+  path: model/data/rdd2022/
+  class_mapping: model/configs/rdd2022_classes.yaml
+  country_filter: [Japan, India, United_States, Czech]
+
+training:
+  epochs: 40
+  early_stopping_patience: 12
+  batch_size: 6
+  num_workers: 4
+  use_amp: true
+  learning_rate: 0.0001
+  optimizer: AdamW
+  weight_decay: 0.0005         # = R
+  momentum: 0.937
+  scheduler: cosine
+  warmup_epochs: 3
+  val_split: 0.2
+  checkpoint_dir: ./checkpoints/rt_detr_v2_RC
+  log_interval: 10
+  seed: 42
+
+  use_ema: true
+  ema_decay: 0.9999
+  ema_tau: 2000
+
+  balanced_sampling: class     # C: nuevo (class | country | both | off)
+
+  early_stopping_metric: map
+  eval_interval: 5
+
+  loss:
+    focal_loss: true
+    focal_gamma: 2.0
+    focal_alpha: 0.25
+    no_object_weight: 0.1
+    class_weight: 1.0
+    bbox_weight: 5.0
+    giou_weight: 2.0
+
+  augmentation:
+    horizontal_flip: true
+    mosaic: 0.0
+    mixup: 0.0
+    mosaic_off_epochs: 0
+    hsv_h: 0.015
+    hsv_s: 0.5
+    hsv_v: 0.4
+    scale: [0.8, 1.2]
+    translate: 0.1
+    random_erasing: 0.3        # = R
+
+evaluation:
+  iou_thresholds: [0.25, 0.5, 0.75]
+  confidence_threshold: 0.5
+  confidence_thresholds_sweep:
+    [0.05, 0.10, 0.15, 0.20, 0.25, 0.30, 0.35, 0.40, 0.45, 0.50,
+     0.55, 0.60, 0.65, 0.70, 0.75, 0.80, 0.85, 0.90, 0.95, 1.00]
+
+output:
+  checkpoint_dir: ./checkpoints/rt_detr_v2_RC
+  results_dir: ./results/rt_detr_v2_RC
+  log_dir: ./logs/rt_detr_v2_RC

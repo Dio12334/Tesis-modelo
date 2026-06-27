@@ -21,7 +21,7 @@ import streamlit as st
 from data_loader import load_all_data, DashboardData, EvaluationReport
 from components.sidebar import render_sidebar
 from components.metrics_overview import render_metrics_overview
-from components.loss_charts import render_loss_chart, render_learning_rate_chart
+from components.loss_charts import render_loss_chart, render_learning_rate_chart, render_threshold_sweep_chart
 from components.class_performance import render_class_performance
 from components.confusion_matrix import render_confusion_matrix
 from components.run_comparison import render_run_comparison
@@ -192,6 +192,8 @@ def _render_region_inner_tabs(
         if region == ALL_REGIONS_LABEL:
             render_loss_chart(selected_run)
             render_learning_rate_chart(selected_run)
+            st.divider()
+            render_threshold_sweep_chart(headline_report)
         else:
             st.caption(
                 "Loss curves are region-independent — training history is "

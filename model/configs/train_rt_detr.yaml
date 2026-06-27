@@ -8,20 +8,18 @@ model:
     num_classes: 5
     confidence_threshold: 0.5
     iou_threshold: 0.5
-    freeze_layers: 10  # Number of initial layers to freeze (0 to total_layers). Optional.
-    backbone_lr: 0.00001   # low LR for frozen-adjacent backbone layers
-    head_lr: 0.0001        # normal LR for encoder/decoder/heads
     backbone_layers: 10    # first N named-parameter groups treated as backbone
 
 dataset:
   type: rdd2022
   path: model/data/rdd2022/
   class_mapping: model/configs/rdd2022_classes.yaml
+  country_filter: [Japan, India, United_States, Czech]  # Norway excluded, china tambien
 
 training:
   epochs: 100
   early_stopping_patience: 25
-  batch_size: 16
+  batch_size: 8
   num_workers: 4
   use_amp: true
   learning_rate: 0.0001
@@ -54,13 +52,13 @@ training:
 
   augmentation:
     horizontal_flip: true
-    mosaic: 0.5
-    mixup: 0.1
-    mosaic_off_epochs: 10
+    mosaic: 0.0
+    mixup: 0.0
+    mosaic_off_epochs: 0
     hsv_h: 0.015
     hsv_s: 0.5
     hsv_v: 0.4
-    scale: [0.5, 1.5]
+    scale: [0.8, 1.2]
     translate: 0.1
 
 evaluation:
@@ -68,7 +66,8 @@ evaluation:
   confidence_threshold: 0.5
   # F1-sweep operating points (Phase-2 evaluation architecture). Required.
   confidence_thresholds_sweep:
-    [0.05, 0.10, 0.15, 0.20, 0.25, 0.30, 0.35, 0.40, 0.45, 0.50]
+    [0.05, 0.10, 0.15, 0.20, 0.25, 0.30, 0.35, 0.40, 0.45, 0.50,
+     0.55, 0.60, 0.65, 0.70, 0.75, 0.80, 0.85, 0.90, 0.95, 1.00]
 
 output:
   checkpoint_dir: ./checkpoints/rt_detr

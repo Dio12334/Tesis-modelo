@@ -1,0 +1,6 @@
+clase,Baseline (v1),v2 (S1+S2+S5+EMA),R (+regularización),RC (+balanceo clase),R + TTA
+alligator crack,0.667,0.706,0.7007,0.6974,0.7132
+longitudinal crack,0.6031,0.6316,0.6366,0.6353,0.637
+other corruption,0.6883,0.7243,0.733,0.7315,0.7349
+pothole,0.4301,0.5165,0.5415,0.5334,0.553
+transverse crack,0.5658,0.598,0.5984,0.5992,0.6068
