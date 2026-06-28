@@ -24,7 +24,7 @@ training:
   letterbox: true
   epochs: 15
   early_stopping_patience: 12
-  batch_size: 6
+  batch_size: 4
   num_workers: 4
   use_amp: true
   use_torch_compile: false

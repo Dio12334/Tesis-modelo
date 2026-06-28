@@ -1,9 +1,9 @@
-name: exp_N0_baseline
+name: exp_N3b_norway_square_1024
 model:
   type: rt_detr
   config:
     model_size: l
-    input_size: 768
+    input_size: 1024
     num_classes: 5
     confidence_threshold: 0.5
     iou_threshold: 0.5
@@ -19,12 +19,13 @@ dataset:
   - India
   - United_States
   - Czech
+  - Norway
 training:
   letterbox: false
   epochs: 15
   early_stopping_patience: 12
-  batch_size: 4
-  num_workers: 4
+  batch_size: 6
+  num_workers: 8
   use_amp: true
   use_torch_compile: false
   learning_rate: 0.0001
@@ -34,7 +35,7 @@ training:
   scheduler: cosine
   warmup_epochs: 3
   val_split: 0.2
-  checkpoint_dir: ./checkpoints/exp_N0_baseline
+  checkpoint_dir: ./checkpoints/exp_N3b_norway_square_1024
   log_interval: 10
   seed: 42
   use_ema: true
@@ -61,6 +62,7 @@ training:
     - 1.2
     translate: 0.1
     random_erasing: 0.3
+  prefetch_factor: 4
 evaluation:
   iou_thresholds:
   - 0.25
@@ -89,6 +91,6 @@ evaluation:
   - 0.95
   - 1.0
 output:
-  checkpoint_dir: ./checkpoints/exp_N0_baseline
-  results_dir: ./results/exp_N0_baseline
+  checkpoint_dir: ./checkpoints/exp_N3b_norway_square_1024
+  results_dir: ./results/exp_N3b_norway_square_1024
   log_dir: ./logs/rt_detr_norway_768

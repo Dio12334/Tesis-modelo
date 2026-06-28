@@ -66,17 +66,65 @@ de **Noruega**) y el **mAP global**.
       aspecto + ajusta las cajas; como es escala uniforme + pad, **conserva el IoU/mAP**. Flag
       `training.letterbox`. Reutilizable (también ayuda a Perú 16:9).
 - [x] Config `model/configs/train_rt_detr_norway_letterbox.yaml` (= N3: + Noruega, 1024, letterbox).
-- [ ] **Ejecutar N0–N3** (a la espera del OK). N1/N2 son tweaks del config (quitar `letterbox`, bajar a 768).
+- [x] **N0/N1/N2 ejecutados @768 (laptop, 15 ép)** — ver §6 (Resultados). El runner
+      `model/scripts/run_norway_experiments.py` los genera, entrena, evalúa y consolida en JSON.
+- [ ] **N3 @1024 (EC2)**: configs generados (`exp_norway_*_1024.yaml`); pendiente de correr en la EC2.
 - [ ] N4 (tiling/SAHI): requiere preprocesamiento aparte (futuro).
 
-## 5. Cómo correr (cuando se dé el OK)
+## 5. Cómo correr (runner reproducible)
+El runner genera el config, entrena, evalúa per-país y **acumula** todo en
+`logs/norway_experiments/summary.json` (artefacto descargable). Re-ejecutable (salta lo ya evaluado;
+resume lo cortado a media corrida).
 ```bash
-# N3 (principal): + Noruega, 1024, letterbox  (EC2 recomendado por VRAM/resolución)
-python -m model.training.train_detection --config model/configs/train_rt_detr_norway_letterbox.yaml -v
-# luego: evaluar per-country
-python -m model.training.evaluate_detection --config model/configs/train_rt_detr_norway_letterbox.yaml --run-id <ID> --split val
-# N1/N2: copiar el config y poner letterbox:false (N1) o input_size:768 (N2)
+# Laptop @768 — N0/N1/N2 (HECHO):
+python -m model.scripts.run_norway_experiments --epochs 15 --batch 4
+
+# EC2 @1024 — N3 (referencia sin Noruega 1024 + Noruega square 1024 + Noruega letterbox 1024):
+python -m model.scripts.run_norway_experiments --group ec2 --epochs 15 --batch 6 --workers 8
+#   -> resultados en logs/norway_experiments/summary.json  (descargar y analizar)
+#   solo el principal:  --only N3_norway_letterbox_1024
 ```
 
-> Nota: a 1024 + Noruega (8k imágenes grandes) en 8 GB hará OOM — este experimento es **para la EC2**
-> (~25 GB). En la laptop, correr una versión reducida (768 + letterbox) para sanity.
+> Nota: a 1024 + Noruega (8k imágenes grandes) en 8 GB hará OOM — N3 es **para la EC2** (~25 GB). El
+> grupo `ec2` corre tres puntos a 1024 para una comparación limpia: sin Noruega, +Noruega square y
+> +Noruega letterbox (aísla, a 1024, el efecto del letterbox y el de incluir Noruega).
+
+## 6. Resultados (N0/N1/N2 @768, laptop, 15 épocas)
+
+Evaluación sobre el split de validación. mAP@0.5 global, recall y mAP@0.5 per-país.
+
+| Run | preproc | mAP@0.5 global | recall | **Noruega** | Czech | India | Japan | US |
+|-----|---------|---------------:|-------:|------------:|------:|------:|------:|---:|
+| **N0** (sin Noruega) | square | **0.632** | 0.619 | — | 0.288 | 0.455 | 0.634 | 0.506 |
+| **N1** (+Noruega) | square | 0.603 | 0.560 | **0.297** | 0.311 | 0.436 | 0.636 | 0.486 |
+| **N2** (+Noruega) | **letterbox** | 0.590 | 0.541 | **0.232** | 0.330 | 0.408 | 0.635 | 0.487 |
+
+**Dos hallazgos:**
+
+1. **Incluir Noruega baja el mAP global con cualquier preprocesamiento** (0.632 → 0.603 → 0.590). Esto
+   **valida la exclusión original** de Noruega para el modelo @768.
+2. **El letterbox NO recuperó a Noruega: la empeoró** (0.297 → 0.232, −22 %). La hipótesis del §2
+   (la distorsión 2:1 era el cuello) queda **refutada a 768 px**.
+
+**Por qué (re-diagnóstico — el cuello es resolución, no distorsión).** La cuenta de píxeles lo explica:
+
+- *Resize cuadrado (N1):* 4040×2035 → llena 768×768. Distorsiona (aplasta horizontal) pero el contenido
+  vertical baja solo 2.65× (2035→768).
+- *Letterbox (N2):* preserva el 2:1 → encoge a 768×**384** + barras grises. **Desperdicia media imagen**
+  en padding y el contenido vertical baja 5.26× (2035→384).
+
+Es decir, a presupuesto de píxeles fijo, el letterbox compra "no distorsión" **a costa de resolución**;
+y como el daño fino de Noruega depende de la resolución (su recall cae 0.377 → 0.308), el cambio es
+net-negativo. **Prueba cruzada:** en los países cuadrados (~1:1, donde letterbox ≈ square) el efecto es
+neutro (Japan/US planos, Czech +0.02, India −0.03) → la implementación del letterbox es correcta y el
+golpe se concentra en la única imagen 2:1 (Noruega). El cuello real es el **downsample 5.26×** que
+destruye el daño antes de que el modelo lo vea.
+
+**Conclusión y siguiente paso.** El letterbox solo puede pagar **si va con más resolución**. Por eso N3
+(letterbox + **1024**, downsample 3.9× en vez de 5.26×) es la prueba decisiva, y por encima N4
+(tiling/SAHI), el método estándar para imágenes de 8 MP. A 768 la laptop no puede dar a Noruega los
+píxeles que necesita con ningún preprocesamiento. Mientras tanto, **Noruega se mantiene excluida** del
+modelo de referencia @768.
+
+> Reproducir: `logs/norway_experiments/summary.json` (consolidado del runner). N3 se corre en la EC2
+> con `--group ec2` (§5) y vuelca su resultado al mismo JSON para descargar y comparar contra esta tabla.

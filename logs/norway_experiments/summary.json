@@ -1,0 +1,55 @@
+{
+  "N0_baseline": {
+    "map_50": 0.6321699018665502,
+    "recall": 0.6192710212919523,
+    "per_class": {
+      "alligator crack": 0.6955180286335992,
+      "longitudinal crack": 0.6279209966315416,
+      "other corruption": 0.7355591211843912,
+      "pothole": 0.5101287689332785,
+      "transverse crack": 0.5917225939499405
+    },
+    "per_country": {
+      "Czech": 0.2882,
+      "India": 0.4545,
+      "Japan": 0.6337,
+      "United_States": 0.5055
+    }
+  },
+  "N1_norway_square": {
+    "map_50": 0.6027904107519987,
+    "recall": 0.5596261682242991,
+    "per_class": {
+      "alligator crack": 0.6788027026415654,
+      "longitudinal crack": 0.5720628577671365,
+      "other corruption": 0.7093091141243614,
+      "pothole": 0.5095257328955032,
+      "transverse crack": 0.5442516463314274
+    },
+    "per_country": {
+      "Czech": 0.3108,
+      "India": 0.4357,
+      "Japan": 0.6357,
+      "Norway": 0.2974,
+      "United_States": 0.4861
+    }
+  },
+  "N2_norway_letterbox": {
+    "map_50": 0.58963918328957,
+    "recall": 0.5407476635514019,
+    "per_class": {
+      "alligator crack": 0.6684144774947509,
+      "longitudinal crack": 0.5428047487441497,
+      "other corruption": 0.7118461385051492,
+      "pothole": 0.495088317756083,
+      "transverse crack": 0.5300422339477169
+    },
+    "per_country": {
+      "Czech": 0.33,
+      "India": 0.4078,
+      "Japan": 0.6351,
+      "Norway": 0.2319,
+      "United_States": 0.487
+    }
+  }
+}
