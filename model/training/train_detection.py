@@ -66,6 +66,7 @@ class RDD2022TorchDataset(torch.utils.data.Dataset):
         self,
         dataset: RDD2022Dataset,
         input_size: int = 320,
+        letterbox: bool = False,
         augmentation=None,
         mosaic: float = 0.0,
         mixup: float = 0.0,
@@ -77,6 +78,12 @@ class RDD2022TorchDataset(torch.utils.data.Dataset):
         Args:
             dataset: Underlying RDD2022Dataset instance.
             input_size: Target image size (square).
+            letterbox: If True, resize preserving aspect ratio into the square
+                ``input_size`` canvas with grey (114) padding instead of a plain
+                square resize. Keeps non-square sources (e.g. Norway 4040x2035,
+                2:1) undistorted; bboxes are remapped to the padded frame. Only
+                applied on the single-image paths (augmentation/direct), not on
+                the Mosaic path (Mosaic is disabled for the high-res configs).
             augmentation: Per-image augmentation Compose pipeline or None.
             mosaic: Probability of applying Mosaic augmentation (0=off, 1=always).
             mixup: Probability of applying MixUp after Mosaic (0=off).
@@ -92,6 +99,7 @@ class RDD2022TorchDataset(torch.utils.data.Dataset):
         """
         self._annotations = dataset.get_annotations()
         self._input_size = input_size
+        self._letterbox = bool(letterbox)
         self._class_names = dataset.get_class_names()
         self._augmentation = augmentation  # augmentation.Compose pipeline or None
         self._mosaic_p = mosaic
@@ -199,6 +207,29 @@ class RDD2022TorchDataset(torch.utils.data.Dataset):
         for bbox in annotation.bounding_boxes:
             bboxes.append([bbox.x_min, bbox.y_min, bbox.x_max, bbox.y_max, bbox.class_label])
         return image_np, bboxes
+
+    def _letterbox_np(self, image_np: np.ndarray):
+        """Resize an HxWx3 uint8 image into a square ``input_size`` canvas
+        preserving aspect ratio, padding the remainder with grey (114).
+
+        Returns ``(canvas, nw, nh, pad_x, pad_y)`` where ``nw, nh`` is the
+        resized content size and ``pad_x, pad_y`` the top-left padding. A
+        normalized bbox coordinate maps to pixels as
+        ``x_px = x_norm * nw + pad_x`` and ``y_px = y_norm * nh + pad_y``.
+        Because it is a uniform scale plus a translation, IoU/mAP are preserved.
+        """
+        size = self._input_size
+        h, w = image_np.shape[:2]
+        if h == 0 or w == 0:
+            return np.full((size, size, 3), 114, dtype=np.uint8), size, size, 0, 0
+        r = min(size / w, size / h)
+        nw, nh = int(round(w * r)), int(round(h * r))
+        nw, nh = max(1, min(size, nw)), max(1, min(size, nh))
+        resized = cv2.resize(image_np, (nw, nh), interpolation=cv2.INTER_LINEAR)
+        canvas = np.full((size, size, 3), 114, dtype=np.uint8)
+        pad_x, pad_y = (size - nw) // 2, (size - nh) // 2
+        canvas[pad_y:pad_y + nh, pad_x:pad_x + nw] = resized
+        return canvas, nw, nh, pad_x, pad_y
 
     def _build_mosaic(self, idx: int) -> Tuple[np.ndarray, List[List]]:
         """Build a 4-image mosaic, Ultralytics-style.
@@ -481,23 +512,30 @@ class RDD2022TorchDataset(torch.utils.data.Dataset):
 
                 image_np, aug_bboxes = self._augmentation(image_np, aug_bboxes)
 
-                # Resize to input_size and convert to tensor (avoid PIL intermediate)
-                h, w = image_np.shape[:2]
-                if h != self._input_size or w != self._input_size:
-                    image_np = cv2.resize(
-                        image_np, (self._input_size, self._input_size),
-                        interpolation=cv2.INTER_LINEAR,
-                    )
+                # Resize to input_size (letterbox-aware) and convert to tensor
+                # (avoid PIL intermediate). For square resize nw=nh=input_size
+                # and pad=0, so the bbox mapping below reduces to the original.
+                if self._letterbox:
+                    image_np, nw, nh, pad_x, pad_y = self._letterbox_np(image_np)
+                else:
+                    h, w = image_np.shape[:2]
+                    if h != self._input_size or w != self._input_size:
+                        image_np = cv2.resize(
+                            image_np, (self._input_size, self._input_size),
+                            interpolation=cv2.INTER_LINEAR,
+                        )
+                    nw = nh = self._input_size
+                    pad_x = pad_y = 0
                 image_tensor = torch.from_numpy(
                     image_np.transpose(2, 0, 1).copy()
                 ).float().div_(255.0)
                 boxes = []
                 labels = []
                 for bbox in aug_bboxes:
-                    x1 = bbox[0] * self._input_size
-                    y1 = bbox[1] * self._input_size
-                    x2 = bbox[2] * self._input_size
-                    y2 = bbox[3] * self._input_size
+                    x1 = bbox[0] * nw + pad_x
+                    y1 = bbox[1] * nh + pad_y
+                    x2 = bbox[2] * nw + pad_x
+                    y2 = bbox[3] * nh + pad_y
                     if x2 > x1 and y2 > y1:
                         boxes.append([x1, y1, x2, y2])
                         class_idx = self._resolve_class_idx(
@@ -505,15 +543,25 @@ class RDD2022TorchDataset(torch.utils.data.Dataset):
                         )
                         labels.append(class_idx)
             else:
-                image_tensor = self._transform(image)
-                image.close()  # Release PIL buffer
+                if self._letterbox:
+                    image_np = np.array(image)
+                    image.close()  # Release PIL buffer
+                    image_np, nw, nh, pad_x, pad_y = self._letterbox_np(image_np)
+                    image_tensor = torch.from_numpy(
+                        image_np.transpose(2, 0, 1).copy()
+                    ).float().div_(255.0)
+                else:
+                    image_tensor = self._transform(image)
+                    image.close()  # Release PIL buffer
+                    nw = nh = self._input_size
+                    pad_x = pad_y = 0
                 boxes = []
                 labels = []
                 for bbox in annotation.bounding_boxes:
-                    x1 = bbox.x_min * self._input_size
-                    y1 = bbox.y_min * self._input_size
-                    x2 = bbox.x_max * self._input_size
-                    y2 = bbox.y_max * self._input_size
+                    x1 = bbox.x_min * nw + pad_x
+                    y1 = bbox.y_min * nh + pad_y
+                    x2 = bbox.x_max * nw + pad_x
+                    y2 = bbox.y_max * nh + pad_y
                     if x2 > x1 and y2 > y1:
                         boxes.append([x1, y1, x2, y2])
                         class_idx = self._resolve_class_idx(
@@ -992,12 +1040,26 @@ def train(config_path: str, verbose: bool = False, resume_from: Optional[str] = 
     mosaic_off_epochs = int(aug_config.get("mosaic_off_epochs", 0))
     logger.info("Mosaic p=%.2f, MixUp p=%.2f, mosaic_off_epochs=%d", mosaic_p, mixup_p, mosaic_off_epochs)
 
+    # Letterbox resize (aspect-preserving + grey pad) for non-square sources
+    # (e.g. Norway 2:1). Applied on the single-image paths (train + val) only;
+    # Mosaic and letterbox are not combined (Mosaic is off for the high-res configs).
+    use_letterbox = bool(training_config.get("letterbox", False))
+    if use_letterbox:
+        logger.info("Letterbox resize ENABLED (aspect-preserving, train + val).")
+        if mosaic_p > 0:
+            logger.warning(
+                "letterbox=True with mosaic=%.2f: the Mosaic path is not letterboxed; "
+                "only the single-image paths preserve aspect.", mosaic_p
+            )
+
     # Create PyTorch datasets
     train_torch = RDD2022TorchDataset(
-        train_ds, input_size=input_size, augmentation=augmentation_pipeline,
-        mosaic=mosaic_p, mixup=mixup_p,
+        train_ds, input_size=input_size, letterbox=use_letterbox,
+        augmentation=augmentation_pipeline, mosaic=mosaic_p, mixup=mixup_p,
     )
-    val_torch = RDD2022TorchDataset(val_ds, input_size=input_size)  # No augmentation for validation
+    val_torch = RDD2022TorchDataset(
+        val_ds, input_size=input_size, letterbox=use_letterbox,
+    )  # No augmentation for validation
 
     # On Windows, DataLoader workers require explicit spawn context
     is_windows = platform.system() == "Windows"
