@@ -1,0 +1,82 @@
+name: rdd2022_yolov8s_4country_full_lfc
+
+# COMPLETE YOLO-RD on YOLOv8s (the paper's native family): CSAF + LGECA +
+# SR-WBCE + LFC. This is the faithful reproduction of the paper's full model,
+# and its size (~6.7M params) matches the paper's reported 6.5M. Compare against
+# train_yolov8s_4country_bce.yaml (YOLOv8s baseline) to test whether the full
+# method helps on its native family; contrast with the YOLO26 full+LFC run to
+# test cross-family transfer.
+
+model:
+  type: yolo26  # generic Ultralytics wrapper; pretrained_weights selects YOLOv8s
+  config:
+    model_size: "s"
+    input_size: 640
+    num_classes: 5
+    end2end: false
+    confidence_threshold: 0.25
+    iou_threshold: 0.5
+    pretrained_weights: "yolov8s.pt"
+    freeze_layers: 0
+    csaf: true
+    lgeca: true
+    lfc: true
+
+dataset:
+  type: rdd2022
+  path: model/data/rdd2022/complete
+  class_mapping: model/configs/rdd2022_classes.yaml
+  country_filter:
+    - Japan
+    - India
+    - Czech
+    - United_States
+
+training:
+  epochs: 100
+  early_stopping_patience: 15
+  batch_size: 48
+  num_workers: 8
+  prefetch_factor: 3
+  use_amp: true
+  use_channels_last: false
+  use_torch_compile: false
+  learning_rate: 0.01
+  optimizer: SGD
+  weight_decay: 0.0005
+  momentum: 0.937
+  scheduler: cosine
+  warmup_epochs: 3
+  val_split: 0.2
+  checkpoint_dir: ./checkpoints/yolo26
+  log_interval: 10
+  seed: 42
+  checkpoint_metric: map_50
+  eval_interval: 2
+  loss:
+    label_smoothing: 0.0
+    focal_loss: false
+    sr_wbce: true
+    sr_wbce_n: 4
+  augmentation:
+    mosaic: 1.0
+    mixup: 0.05
+    mosaic_off_epochs: 10
+    horizontal_flip: true
+    vertical_flip: false
+    hsv_h: 0.015
+    hsv_s: 0.5
+    hsv_v: 0.4
+    scale: [0.75, 1.25]
+    translate: 0.1
+
+evaluation:
+  iou_thresholds: [0.5]
+  confidence_threshold: 0.25
+  confidence_thresholds_sweep:
+    [0.05, 0.10, 0.15, 0.20, 0.25, 0.30, 0.35, 0.40, 0.45, 0.50]
+
+output:
+  checkpoint_dir: ./checkpoints/yolo26
+  results_dir: ./checkpoints/yolo26
+  log_dir: ./logs/yolo26
