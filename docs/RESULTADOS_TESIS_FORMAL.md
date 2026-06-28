@@ -480,6 +480,19 @@ rigurosa. En cuanto a la generalización, persiste la **brecha entre países**, 
 paradigmático de bajo desempeño no atribuible a la cantidad de datos, cuyo origen —presumiblemente la
 calidad del etiquetado— merece una auditoría específica.
 
+Una segunda limitación, más sutil pero importante para interpretar las cifras absolutas, deriva de la
+naturaleza del conjunto: RDD2022 se construye a partir de **secuencias de vídeo**, de modo que muchas
+imágenes son **fotogramas casi idénticos** tomados con fracciones de segundo de diferencia. Al
+particionar de forma aleatoria, es probable que pares de fotogramas casi duplicados queden **repartidos
+entre entrenamiento y validación**, una forma de **fuga de información** (*data leakage*) que infla de
+manera optimista el desempeño medido. En consecuencia, los valores absolutos reportados —por ejemplo,
+el mAP@0.5 de 0,649— deben leerse como un **límite superior**: un protocolo más estricto, que deduplique
+por *hash* perceptual o por distancia entre fotogramas antes de la partición, arrojaría con probabilidad
+cifras algo menores. Conviene subrayar, no obstante, que esta fuga **no compromete las conclusiones
+comparativas** del estudio: como todas las configuraciones comparten exactamente la misma partición, el
+efecto de la fuga es común a todas y las diferencias *entre* ellas —la atribución de cada decisión de
+diseño— siguen siendo válidas. Es el nivel absoluto, no el orden relativo, lo que queda matizado.
+
 Entre las líneas abiertas, la de mayor recorrido es el **pseudo-etiquetado** del conjunto de test sin
 anotar, que fue la técnica decisiva de los ganadores del reto y que no se ha explorado. En la misma
 dirección, la construcción de un **conjunto de modelos** (por ejemplo, combinando RT-DETR con una
@@ -514,6 +527,49 @@ resolución más alta (1024 píxeles o superior, en una máquina con más memori
 **teselado** (*tiling*/SAHI), el procedimiento estándar para imágenes de muy alta resolución; ambos
 caminos quedan planteados como trabajo futuro y su detalle se documenta en
 [EXPERIMENTO_NORUEGA.md](EXPERIMENTO_NORUEGA.md).
+
+### 8.1. Mejoras del conjunto de datos como trabajo futuro (priorizadas por palanca)
+
+Las líneas anteriores se centran en el método —pseudo-etiquetado, conjuntos de modelos, mayor
+resolución—. Existe, en paralelo, un conjunto de **intervenciones sobre los datos** cuyo orden de
+prioridad se desprende directamente del diagnóstico de este trabajo: el cuello de botella es
+**encontrar el daño pequeño y la calidad de las etiquetas**, no la confusión entre clases. Un principio
+gobierna todas ellas y conviene hacerlo explícito: cualquier cambio en los datos debe aplicarse **de
+forma idéntica a todas las configuraciones comparadas**, pues de lo contrario se rompe la validez de las
+comparaciones que sostienen las conclusiones.
+
+La intervención de mayor palanca es la **mejora de la calidad y la consistencia de las etiquetas**. En
+primer lugar, la **deduplicación de fotogramas casi idénticos** antes de la partición —ya señalada como
+limitación—, que entrega una cifra honesta y un punto de partida limpio. En segundo lugar, y de forma
+destacada, una **auditoría de las etiquetas de India**: como se mostró en el §6.2, India rinde por
+debajo de lo que su volumen de datos haría esperar —no es un problema de cantidad, sino con toda
+probabilidad de ruido o inconsistencia en el anotado—, de modo que muestrear una porción, cuantificar la
+tasa de cajas mal etiquetadas o ausentes y re-anotar (o ponderar a la baja) es el paso individual con
+mayor probabilidad de mover la métrica. A ello se suman dos depuraciones: **resolver la clase «otras
+corrupciones»**, un cajón de sastre heterogéneo que conviene subdividir en subclases más limpias o, en
+su defecto, eliminar para alinearse con la literatura de cuatro clases —con la salvedad de que prescindir
+de ella reduciría el mAP en una cantidad estimada de un par de puntos, no medida en este estudio—; y el
+**descarte de casos vacíos o ilegibles**, es decir, imágenes que quedan sin cajas válidas tras el
+filtrado y cajas por debajo de un tamaño mínimo legible.
+
+La segunda familia de intervenciones consiste en **añadir datos que ataquen directamente el déficit de
+recall**. La más alineada con el diagnóstico es la **incorporación de datos dirigidos de la clase
+bache** —la más rara y difícil, y aquella sobre la que el balanceo por clase fracasó—: técnicas de
+*copy-paste* de baches, o la fusión de una fuente rica en este daño, atacan la causa real (recall y
+resolución) allí donde el muestreo no pudo. En segundo término, la **recuperación correcta de los países
+excluidos**: para Noruega, y como confirmó el experimento de alta resolución, no basta con corregir la
+relación de aspecto, sino que hace falta mayor resolución de entrada (1024 píxeles o más) o teselado;
+para China, bastaría con incluir únicamente el subconjunto captado **desde vehículo**, excluyendo las
+tomas con dron que motivaron su exclusión. Por último, la **ampliación con conjuntos afines** —N-RDD2024,
+una extensión del propio RDD2022, y RDD2020— aumentaría el volumen y la diversidad y mejoraría la
+comparabilidad con la literatura, si bien supone un salto de alcance mayor que las depuraciones
+anteriores.
+
+En conjunto, estas medidas **elevarían el desempeño absoluto** —en particular el recall sobre baches y
+objetos pequeños— y acercarían las cifras al rango del 64–66 % que reporta la literatura comparable;
+pero, aplicadas de manera uniforme, **no alterarían las conclusiones comparativas** del estudio. Es, en
+suma, una hoja de ruta de datos ordenada por palanca y anclada al diagnóstico de recall y de calidad de
+etiquetas establecido en las secciones anteriores, no un catálogo de buenas intenciones.
 
 ---
 
