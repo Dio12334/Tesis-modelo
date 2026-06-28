@@ -1,0 +1,33 @@
+# Ablation report manifest — maps experiment labels to run IDs.
+# Consumed by:  python -m model.scripts.ablation_report --manifest model/configs/ablation_manifest.yaml
+# Reports are read from  <checkpoint_dir>/yolo26/<run_id>/val_evaluation_report.json
+# Runs are grouped by `base`; the FIRST run of each base is its baseline (Δ is
+# measured against it). Fill run_id for the LFC rows once those runs land.
+
+checkpoint_dir: ./checkpoints
+
+runs:
+  - label: "Baseline (BCE)"
+    base: YOLO26-S
+    run_id: f77e9617-da8a-418e-8e47-5183449e1651
+  - label: "+ SR-WBCE"
+    base: YOLO26-S
+    run_id: 8af70023-e435-4eb4-9573-aa10ab00a714
+  - label: "+ CSAF+LGECA+SR-WBCE (full)"
+    base: YOLO26-S
+    run_id: cbdea0cd-88fe-4d13-8f55-c6f4e4502fa8
+
+  - label: "Baseline (BCE)"
+    base: YOLOv8s
+    run_id: 57842f5a-539d-4a77-8766-476c37c81e04
+  - label: "+ CSAF+LGECA+SR-WBCE (full)"
+    base: YOLOv8s
+    run_id: 8ee60f36-625e-4bf1-9407-eb4820e7de41
+
+  # --- Fill these once the LFC runs complete (for the efficiency column) ---
+  # - label: "+ full + LFC"
+  #   base: YOLO26-S
+  #   run_id: <run_id>
+  # - label: "+ full + LFC"
+  #   base: YOLOv8s
+  #   run_id: <run_id>
