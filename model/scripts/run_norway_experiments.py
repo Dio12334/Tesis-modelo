@@ -60,9 +60,12 @@ GROUPS = {
 }
 
 
-def make_config(name, countries, letterbox, epochs, batch, input_size, workers=None):
+def make_config(name, countries, letterbox, epochs, batch, input_size, workers=None,
+                data_path=None):
     cfg = yaml.safe_load(open(BASE_CFG, encoding="utf-8"))
     cfg["name"] = f"exp_{name}"
+    if data_path:
+        cfg["dataset"]["path"] = data_path  # loader busca <path>/train/{img,ann}
     cfg["dataset"]["country_filter"] = list(countries)
     cfg["training"]["letterbox"] = bool(letterbox)
     cfg["training"]["epochs"] = int(epochs)
@@ -115,6 +118,9 @@ def main():
     ap.add_argument("--group", choices=["laptop", "ec2", "all"], default="laptop",
                     help="laptop=N0/N1/N2 @768 (def); ec2=N3 @1024 (~25GB); all=todos")
     ap.add_argument("--workers", type=int, default=None, help="override num_workers (EC2: 8)")
+    ap.add_argument("--data-path", default=None,
+                    help="override dataset.path; el loader busca <path>/train/{img,ann}. "
+                         "EC2: model/data/rdd2022/complete")
     ap.add_argument("--only", default=None, help="correr solo un experimento por nombre")
     ap.add_argument("--force", action="store_true", help="rehacer aunque ya exista reporte")
     ap.add_argument("--dry-run", action="store_true", help="solo generar configs y mostrar el plan")
@@ -138,7 +144,7 @@ def main():
     for name, countries, letterbox, input_size, exp_batch in exps:
         batch = args.batch or exp_batch
         cfg_path, ckpt_dir = make_config(name, countries, letterbox, args.epochs, batch,
-                                         input_size, args.workers)
+                                         input_size, args.workers, args.data_path)
         eval_log = LOGDIR / f"{name}_eval.log"
 
         if args.dry_run:
