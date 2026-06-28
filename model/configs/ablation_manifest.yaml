@@ -1,0 +1,30 @@
+# Ablation report manifest — maps experiment labels to run IDs + checkpoint subfolders.
+# Consumed by:  python -m model.scripts.ablation_report --manifest model/configs/ablation_manifest.yaml
+# Reports are read from  <checkpoint_dir>/<subdir>/<run_id>/val_evaluation_report.json
+# Runs are grouped by `base`; the FIRST run of each base is its baseline (Δ vs it).
+
+checkpoint_dir: ./checkpoints
+subdir: yolo26            # default subfolder; override per-run with `subdir:`
+
+runs:
+  - label: "Baseline (BCE)"
+    base: YOLO26-S
+    subdir: yolo26_4country
+    run_id: f77e9617-da8a-418e-8e47-5183449e1651
+  - label: "+ SR-WBCE"
+    base: YOLO26-S
+    subdir: yolo26_4country
+    run_id: 8af70023-e435-4eb4-9573-aa10ab00a714
+  - label: "+ CSAF+LGECA+SR-WBCE (full)"
+    base: YOLO26-S
+    subdir: yolo26_4country
+    run_id: cbdea0cd-88fe-4d13-8f55-c6f4e4502fa8
+
+  - label: "Baseline (BCE)"
+    base: YOLOv8s
+    subdir: yolov7       # folder name is misleading; these are YOLOv8s runs
+    run_id: 57842f5a-539d-4a77-8766-476c37c81e04
+  - label: "+ CSAF+LGECA+SR-WBCE (full)"
+    base: YOLOv8s
+    subdir: yolov7
+    run_id: 8ee60f36-625e-4bf1-9407-eb4820e7de41
